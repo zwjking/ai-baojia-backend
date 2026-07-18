@@ -23,26 +23,30 @@ from sqlalchemy.orm import sessionmaker
 logger = logging.getLogger(__name__)
 
 # ===== 数据库 URL: 优先读环境变量, 否则 fallback 到 SQLite =====
+# ===== 数据库 URL: 优先读环境变量, 否则 fallback 到 SQLite =====
+# Railway 免费套餐不支持出站网络，默认用 SQLite
 DATABASE_URL = os.getenv("DATABASE_URL", None)
 
-if not DATABASE_URL or "postgresql" not in DATABASE_URL.lower():
-    # 本地开发: 用 SQLite
+if not DATABASE_URL or "postgresql" not in DATABASE_URL.lower() or os.getenv("USE_SQLITE", "true").lower() == "true":
+    # 本地开发/Railway免费套餐: 用 SQLite
     _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
     os.makedirs(_DATA_DIR, exist_ok=True)
     DATABASE_URL = f"sqlite:///{os.path.join(_DATA_DIR, 'quote.db')}"
-    logger.info("Using SQLite: %s", DATABASE_URL.replace("sqlite:///", ""))
+    logger.warning("Using SQLite (Railway free tier / no DATABASE_URL) — set USE_SQLITE=false to force PostgreSQL")
 else:
-    # Supabase 强制 SSL 连接，自动追加 sslmode=require
+    # Supabase 强制 SSL 连接
     if "postgresql://" in DATABASE_URL and "sslmode=" not in DATABASE_URL:
         sep = "&" if "?" in DATABASE_URL else "?"
         DATABASE_URL += f"{sep}sslmode=require"
-        logger.info("Added sslmode=require for PostgreSQL connection")
-    logger.info("Using PostgreSQL: %s", DATABASE_URL.replace(DATABASE_URL.split('@')[0] + '@', 'postgresql://***@'))
+    logger.info("Using PostgreSQL: ***@%s", DATABASE_URL.split('@')[1] if '@' in DATABASE_URL else DATABASE_URL)
 
 # ===== 引擎配置 =====
 engine_kwargs = {}
 if DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
+else:
+    # PostgreSQL: 连接超时 10s，防止启动卡死
+    engine_kwargs["connect_args"] = {"connect_timeout": 10}
 
 engine = create_engine(DATABASE_URL, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -153,5 +157,37 @@ class UserConsentLog(Base):
     agreed_at = Column(DateTime, default=func.now(), nullable=False)
 
 
-# 启动时建表
-Base.metadata.create_all(bind=engine)
+# ===== 启动时建表（容错：PostgreSQL 连不上就 fallback 到 SQLite）=====
+def _create_tables():
+    """建表，如果 PostgreSQL 连接失败则自动降级到 SQLite"""
+    original_url = DATABASE_URL
+    try:
+        logger.info("Attempting to create tables on %s...", 
+                    DATABASE_URL.replace(DATABASE_URL.split('@')[0] + '@', 'postgresql://***@') 
+                    if DATABASE_URL.startswith('postgresql') else DATABASE_URL)
+        Base.metadata.create_all(bind=engine)
+        logger.info("Table creation successful.")
+    except Exception as e:
+        logger.error("PostgreSQL table creation failed: %s", str(e)[:200])
+        # Fallback to SQLite
+        sqlite_url = f"sqlite:///{os.path.join(os.path.dirname(__file__), '..', 'data', 'quote.db')}"
+        logger.warning("Falling back to SQLite: %s", sqlite_url)
+        global DATABASE_URL
+        DATABASE_URL = sqlite_url
+        # Recreate engine with SQLite
+        from sqlalchemy import create_engine as _ce
+        global engine, SessionLocal
+        engine = _ce(sqlite_url, connect_args={"check_same_thread": False})
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        # Re-bind all models to new engine
+        for model in Base._decl_class_registry.values():
+            if hasattr(model, '__table__'):
+                model.__table__.bind = engine
+        try:
+            Base.metadata.create_all(bind=engine)
+            logger.info("SQLite table creation successful (fallback).")
+        except Exception as e2:
+            logger.critical("SQLite fallback also failed: %s", str(e2))
+            raise
+
+_create_tables()
