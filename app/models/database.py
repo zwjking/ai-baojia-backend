@@ -32,6 +32,11 @@ if not DATABASE_URL or "postgresql" not in DATABASE_URL.lower():
     DATABASE_URL = f"sqlite:///{os.path.join(_DATA_DIR, 'quote.db')}"
     logger.info("Using SQLite: %s", DATABASE_URL.replace("sqlite:///", ""))
 else:
+    # Supabase 强制 SSL 连接，自动追加 sslmode=require
+    if "postgresql://" in DATABASE_URL and "sslmode=" not in DATABASE_URL:
+        sep = "&" if "?" in DATABASE_URL else "?"
+        DATABASE_URL += f"{sep}sslmode=require"
+        logger.info("Added sslmode=require for PostgreSQL connection")
     logger.info("Using PostgreSQL: %s", DATABASE_URL.replace(DATABASE_URL.split('@')[0] + '@', 'postgresql://***@'))
 
 # ===== 引擎配置 =====
