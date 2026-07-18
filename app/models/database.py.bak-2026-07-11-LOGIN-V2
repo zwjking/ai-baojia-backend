@@ -1,0 +1,67 @@
+"""
+SQLAlchemy ORM 模型 - W2 P1
+
+三张表:
+  users    - 用户(手机号注册)
+  quotes   - 报价记录(含原始问卷+返回JSON)
+  leads    - 留资记录
+
+启动时自动建表。
+"""
+from __future__ import annotations
+
+from sqlalchemy import Column, DateTime, Integer, String, Text, func
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+from sqlalchemy import create_engine
+import os
+
+# SQLite 路径: app/data/quote.db
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+os.makedirs(_DATA_DIR, exist_ok=True)
+DATABASE_URL = f"sqlite:///{os.path.join(_DATA_DIR, 'quote.db')}"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+class User(Base):
+    """用户表"""
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    mobile = Column(String(11), unique=True, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    quote_count = Column(Integer, default=0)
+
+
+class Quote(Base):
+    """报价记录表"""
+    __tablename__ = "quotes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=True)  # 未登录用户可为空
+    survey_json = Column(Text, nullable=False)  # 原始问卷 JSON
+    quote_json = Column(Text, nullable=False)   # agnes 或 fallback 返回的 JSON
+    source = Column(String(20))  # 'agnes' or 'fallback'
+    request_id = Column(String(64))  # agnes request id
+    generated_at = Column(DateTime, default=func.now())
+
+
+class Lead(Base):
+    """留资表"""
+    __tablename__ = "leads"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False)
+    name = Column(String(20))
+    phone = Column(String(11))
+    district = Column(String(20))
+    remark = Column(String(200))
+    created_at = Column(DateTime, default=func.now())
+
+
+# 启动时自动建表
+Base.metadata.create_all(bind=engine)

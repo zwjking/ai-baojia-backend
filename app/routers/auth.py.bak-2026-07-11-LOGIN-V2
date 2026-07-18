@@ -1,0 +1,75 @@
+"""
+认证接口 - W2 P1
+
+POST /api/login - 手机号+验证码登录
+  - 验证码固定 123456 (从 .env 读 LOGIN_FIXED_CODE)
+  - 新用户自动注册
+  - 返回 token + user_id
+  - 限流 1 QPS (防爆破)
+"""
+from __future__ import annotations
+
+import logging
+import os
+import uuid
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Depends, status
+from pydantic import BaseModel, Field
+
+from app.models.database import SessionLocal, User
+from app.utils.rate_limit import get_login_limiter
+
+router = APIRouter(prefix="/api", tags=["auth"])
+logger = logging.getLogger(__name__)
+
+
+class LoginRequest(BaseModel):
+    mobile: str = Field(..., min_length=11, max_length=11, description="手机号")
+    code: str = Field(..., min_length=6, max_length=6, description="验证码")
+
+
+class LoginResponse(BaseModel):
+    token: str
+    user_id: int
+
+
+@router.post("/login", response_model=LoginResponse)
+async def login(req: LoginRequest):
+    """
+    登录 - 手机号 + 固定验证码
+    W2 P1: 限流 1 QPS (防爆破)
+    """
+    # 限流 (非阻塞,超限返回429)
+    result = get_login_limiter().acquire()
+    if not result.allowed:
+        logger.warning("rate limited: /api/login")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "rate_limited", "hint": "登录过于频繁,请稍后再试", "retry_after": result.retry_after},
+        )
+
+    # 验证码校验
+    fixed_code = os.getenv("LOGIN_FIXED_CODE", "123456")
+    if req.code != fixed_code:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "invalid_code", "hint": f"验证码错误 (测试固定码: {fixed_code})"},
+        )
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.mobile == req.mobile).first()
+        if not user:
+            # 新用户注册
+            user = User(mobile=req.mobile)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            logger.info("新用户注册 mobile=%s user_id=%s", req.mobile, user.id)
+        else:
+            logger.info("用户登录 mobile=%s user_id=%s", req.mobile, user.id)
+
+        return LoginResponse(token=str(uuid.uuid4()), user_id=user.id)
+    finally:
+        db.close()

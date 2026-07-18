@@ -1,0 +1,142 @@
+"""
+报价接口 - POST /api/quote
+
+流程:
+  1. Pydantic 强校验(8 步问卷)
+  2. 限流 5 QPS
+  3. 调 agnes-2.0-flash,失败重试 1 次
+  4. 仍失败 -> L2 fallback
+  5. 返回报价 JSON
+  6. agnes 成功 -> 写入 SQLite quotes 表
+
+W2 P1 调整:
+  - 增加 user_id 字段关联
+  - 报价成功后写入 quotes 表
+  - agnes 失败走 fallback 时不写 quotes 表
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query, status
+from pydantic import Field
+
+from app.models.database import Quote, SessionLocal
+from app.models.schemas import QuoteRequest, QuoteResponse
+from app.services.agnes_client import AgnesCallError, quote_via_agnes
+from app.services.fallback import _load_prices, compute_fallback
+from app.utils.rate_limit import get_quote_limiter
+
+router = APIRouter(prefix="/api", tags=["quote"])
+logger = logging.getLogger(__name__)
+
+
+# W2 调整: user_id 关联(可选, 未登录也能报)
+class QuoteRequestW2(QuoteRequest):
+    """POST /api/quote W2 版本,增加 user_id(可选)"""
+    user_id: Optional[int] = Field(
+        default=None,
+        description="W2 关联用户 ID (登录后必填,W2 P1)",
+    )
+
+
+@router.post("/quote", response_model=QuoteResponse)
+async def create_quote(
+    req: QuoteRequestW2,
+    force_fallback: bool = Query(
+        default=False,
+        description="测试旁路: true=跳过 agnes,直接走 fallback (P0 验证热重载用)",
+    ),
+):
+    """
+    创建报价 - agnes 主路,fallback 兜底
+    W2 P1: agnes 成功后写入 SQLite quotes 表
+    """
+    t0 = time.perf_counter()
+    logger.info(
+        "POST /api/quote area=%.1f grade=%s pack=%s district=%s user_id=%s force_fallback=%s",
+        req.area, req.grade.value, req.pack.value, req.district.value,
+        req.user_id, force_fallback,
+    )
+
+    # 限流
+    result = get_quote_limiter().acquire()
+    if not result.allowed:
+        logger.warning("rate limited: /api/quote")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "rate_limited", "hint": "请求过于频繁,请稍后再试", "retry_after": result.retry_after},
+        )
+
+    prices = _load_prices()
+    source = "fallback"
+    request_id = None
+    agnes_elapsed_ms = 0.0
+    agnes_error = None
+    db = SessionLocal()
+    try:
+        # ===== L1: agnes (测试旁路 force_fallback=true 时跳过) =====
+        if not force_fallback:
+            try:
+                response, meta = await quote_via_agnes(req, prices, max_retries=1)
+                source = "agnes"
+                request_id = meta.get("request_id")
+                agnes_elapsed_ms = meta.get("elapsed_ms", 0.0)
+                logger.info(
+                    "agnes quote OK request_id=%s total=%.2f items=%d elapsed_ms=%.0f",
+                    request_id, response.total, len(response.items), agnes_elapsed_ms,
+                )
+                # W2 P1: agnes 成功 -> 写入 quotes 表
+                if req.user_id is not None:
+                    quote_record = Quote(
+                        user_id=req.user_id,
+                        survey_json=json.dumps(
+                            {"area": req.area, "layout": req.layout, "grade": req.grade.value,
+                             "pack": req.pack.value, "style": req.style,
+                             "special": req.special, "district": req.district.value},
+                            ensure_ascii=False,
+                        ),
+                        quote_json=json.dumps(
+                            {"total": response.total, "source": "agnes",
+                             "request_id": request_id, "items_count": len(response.items)},
+                            ensure_ascii=False,
+                        ),
+                        source="agnes",
+                        request_id=request_id,
+                    )
+                    db.add(quote_record)
+                    db.commit()
+                    logger.info("quote saved to DB id=%s user_id=%s", quote_record.id, req.user_id)
+                return response
+            except AgnesCallError as e:
+                agnes_error = e
+                logger.warning("agnes quote failed, fallback to L2: %s", e)
+            except Exception as e:
+                agnes_error = e
+                logger.exception("agnes quote unexpected error: %s", e)
+        else:
+            agnes_error = AgnesCallError("force_fallback=true (test bypass)")
+            logger.info("force_fallback=true, skip agnes, go to L2")
+
+        # ===== L2: fallback =====
+        try:
+            response, raw = compute_fallback(req)
+            response.source = "fallback"
+            # W2 P1: fallback 不写 quotes 表(留作后续 W3 决策)
+            if agnes_error:
+                logger.warning(
+                    "fallback used because: %s | total=%.2f items=%d",
+                    agnes_error, response.total, len(response.items),
+                )
+            return response
+        except Exception as e:
+            logger.exception("fallback failed too: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"报价失败(agnes + fallback 均失败): {e}",
+            )
+    finally:
+        db.close()

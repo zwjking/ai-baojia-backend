@@ -1,0 +1,367 @@
+"""
+L2 降级服务 - agnes 调用失败时,使用本地价格基线计算
+
+数据源: app/data/fallback_prices_v3.json
+范围:   8 主材 + 5 辅材 + 5 工种 + 4 档管理费 + 4 档税金 + 5 区区域系数
+档位:   简装 / 中档 / 高档 / 豪华
+模式:   半包 = aux + labor  |  全包 = main + aux + labor  |  整装 = 全包 + 家具家电(全包价×0.4 估算)
+
+工程量规则: 见模块级 _QTY_TABLE(建筑面积 → 各品类用量)
+  - 防水工程量硬编码 18m²(厨卫面积,v3 JSON 未提供)
+  - 整装家具家电无 v3 JSON,硬编码估算公式
+
+W3 v3.5 算法收紧(在 v3 JSON 之上):
+  - _FURNITURE_RATE  0.40 -> 0.20   (家具家电估算减半)
+  - _qty_door        固定 4 -> max(2, ceil(a/25))  (按户型计算)
+  - _mid_price       高档/豪华 改用 30% 分位   (压缩高端偏离)
+  - mgmt_rate        高档 0.10 / 豪华 0.10  (豪华 0.12 封顶)
+
+Pydantic 强约束(由 schemas.QuoteResponse 自动校验):
+  - items ≥ 10 行
+  - breakdown 4 类之和 == total(容差 5 元)
+  - items 合价之和 == total(容差 50 元)
+  - 任何 item total = round(qty * unit_price, 2) (容差 1 元)
+"""
+from __future__ import annotations
+
+import json
+import logging
+import math
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+from app.models.schemas import (
+    BreakdownItem,
+    QuoteItem,
+    QuoteRequest,
+    QuoteResponse,
+)
+
+logger = logging.getLogger(__name__)
+
+# ============== 数据路径 ==============
+# v3 为主(顾工 7/10 交付,10227 字节,高档/豪华档校准下浮 30-50%)
+# v2 备份在 .bak-2026-07-10(已切到 v3)
+# 写死路径避免外部传参
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_DATA_PATH = _DATA_DIR / "fallback_prices_v3.json"
+_PRICES_CACHE: Dict | None = None
+_PRICES_LOADED_AT: str | None = None
+
+
+# ============== 工程量系数表(顾工报告第6节) ==============
+# key: 品类名(严格匹配 v2 JSON 字段) | value: callable(area) -> 工程量
+def _qty_main_tile(area: float) -> float:
+    return round(area * 0.85, 2)
+
+def _qty_main_floor(area: float) -> float:
+    return round(area * 0.55, 2)
+
+def _qty_cabinet(area: float) -> float:
+    return 1.0  # 厨房橱柜固定 1 套
+
+def _qty_wardrobe(area: float) -> float:
+    return round(area * 0.45, 2)  # 全屋柜体定制投影面积
+
+def _qty_door(area: float) -> float:
+    # 室内门按户型计算:每 25m² 一樘,最少 2 樘(小户型保护)
+    # 60m²→3, 89m²→4, 128m²→6, 200m²→8
+    return float(max(2, math.ceil(area / 25)))
+
+def _qty_bathroom(area: float) -> float:
+    return 1.0  # 卫浴套装固定 1 套
+
+def _qty_ceiling(area: float) -> float:
+    return round(area * 0.55, 2)
+
+def _qty_lighting(area: float) -> float:
+    return 1.0  # 灯具固定 1 套
+
+
+# 辅材/人工 - 防水硬编码 18m²(厨卫面积)
+def _qty_water_proof(area: float) -> float:
+    return 18.0  # 硬编码(v3 JSON 未提供)
+
+
+_QTY_TABLE: Dict[str, callable] = {
+    # 主材
+    "客餐厅瓷砖":     _qty_main_tile,
+    "卧室地板":       _qty_main_floor,
+    "厨房橱柜":       _qty_cabinet,
+    "全屋柜体定制":   _qty_wardrobe,
+    "室内门":         _qty_door,
+    "卫浴套装":       _qty_bathroom,
+    "吊顶(含灯槽)":   _qty_ceiling,
+    "灯具":           _qty_lighting,
+    # 辅材
+    "水电料":         lambda a: round(a * 1.0, 2),
+    "防水":           _qty_water_proof,
+    "腻子":           lambda a: round(a * 2.4, 2),   # 涂刷面积
+    "乳胶漆":         lambda a: round(a * 2.4, 2),   # 涂刷面积
+    "五金件":         lambda a: 1.0,                   # 固定 1 套
+    # 人工
+    "水电":           lambda a: round(a * 1.0, 2),     # 建筑面积
+    "瓦工":           lambda a: round(a * 0.85, 2),   # 铺贴面积
+    "木工":           lambda a: round(a * 0.45, 2),   # 投影
+    "油漆":           lambda a: round(a * 2.4, 2),    # 涂刷面积
+    "安装":           lambda a: round(a * 1.0, 2),     # 建筑面积
+}
+
+# 整装家具家电估算系数(v3 JSON 无此部分,硬编码)
+# W3 v3.5 收紧: 0.4 → 0.20(避免大户型家具家电成本爆炸)
+# 200m² 豪华案例: (main+aux+labor) 约 178万 × 0.20 = 35.6 万
+_FURNITURE_RATE = 0.20  # 整装家具家电 ≈ (main+aux+labor) × 0.20
+
+
+# ============== 价格加载(进程内缓存) ==============
+def _read_prices_from_disk() -> Dict:
+    """从磁盘读最新价格基线(每次重读,不缓存)
+    用 utf-8-sig 兼容 BOM (Windows 工具保存的 JSON 经常带 BOM)
+    """
+    with _DATA_PATH.open("r", encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
+def _load_prices() -> Dict:
+    """加载价格基线(进程内缓存)"""
+    global _PRICES_CACHE
+    if _PRICES_CACHE is None:
+        if not _DATA_PATH.exists():
+            raise FileNotFoundError(f"价格基线文件不存在: {_DATA_PATH}")
+        _PRICES_CACHE = _read_prices_from_disk()
+        logger.info("fallback 价格基线已加载 version=%s path=%s",
+                    _PRICES_CACHE.get("version"), _DATA_PATH.name)
+    return _PRICES_CACHE
+
+
+def reload_prices() -> Dict:
+    """
+    热重载价格基线 - 清空内存缓存,重新从 JSON 读取
+
+    用途:
+      - 价格基线更新时,调 POST /api/admin/reload-prices 即可生效,无需重启服务
+
+    返回:
+      重新加载后的价格字典(供 admin 接口回显 version/loaded_at)
+    """
+    global _PRICES_CACHE, _PRICES_LOADED_AT
+    if not _DATA_PATH.exists():
+        raise FileNotFoundError(f"价格基线文件不存在: {_DATA_PATH}")
+    new_data = _read_prices_from_disk()
+    old_version = _PRICES_CACHE.get("version") if _PRICES_CACHE else None
+    _PRICES_CACHE = new_data
+    _PRICES_LOADED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    logger.info(
+        "fallback 价格基线热重载完成 old_version=%s new_version=%s",
+        old_version, new_data.get("version"),
+    )
+    return new_data
+
+
+def get_cache_meta() -> Dict:
+    """返回缓存元信息(供 admin 接口展示)"""
+    return {
+        "version": _PRICES_CACHE.get("version") if _PRICES_CACHE else None,
+        "loaded_at": _PRICES_LOADED_AT,
+        "path": str(_DATA_PATH),
+        "cached": _PRICES_CACHE is not None,
+    }
+
+
+# ============== 内部辅助 ==============
+def _mid_price(spec: Dict, grade: str) -> float:
+    """从 v3 JSON 某品类 spec 中,按 grade 取出参考单价
+
+    W3 v3.5 收紧: 简装/中档仍取中位数 (low+high)/2;
+    高档/豪华 改取 30% 分位 low + (high-low)*0.3
+    (顾工 v3 JSON 高档/豪华区间值偏高,自标 TODO;
+     用低端主导更贴近合肥装修市场实际报价)
+    """
+    lo, hi = spec[grade]
+    if grade in ("高档", "豪华"):
+        # 30% 分位:低端主导,削弱豪华档偏离
+        return round(lo + (hi - lo) * 0.30, 2)
+    # 简装/中档:中位数
+    return round((lo + hi) / 2, 2)
+
+
+def _resolve_qty(name: str, area: float) -> float:
+    """查 _QTY_TABLE 算工程量;找不到抛错(数据/代码不一致)"""
+    fn = _QTY_TABLE.get(name)
+    if fn is None:
+        raise KeyError(f"未配置工程量规则: {name} (v3 JSON 出现新品类?)")
+    return float(fn(area))
+
+
+def _line(name: str, category: str, unit: str, qty: float, unit_price: float) -> Tuple[QuoteItem, float]:
+    """生成一条 QuoteItem 并返回 (item, total)"""
+    total = round(qty * unit_price, 2)
+    item = QuoteItem(
+        name=name, category=category, unit=unit,
+        quantity=qty, unit_price=unit_price, total=total,
+    )
+    return item, total
+
+
+# ============== 核心计算 ==============
+def compute_fallback(req: QuoteRequest) -> Tuple[QuoteResponse, List[dict]]:
+    """
+    用 v2 本地价格基线算报价
+
+    算法(顾工报告 + v3 JSON):
+      1. 按 grade 选档位,每个品类取 [低,高] 中位数
+      2. 乘以工程量系数 -> 算每项小计
+      3. 汇总:
+         - 半包 = aux_total + labor_total
+         - 全包 = + main_total
+         - 整装 = + (main+aux+labor) × 0.4 家具家电
+      4. 乘以 district_factor(区域系数)
+      5. 加管理费 mgmt_rate(grade)
+      6. 加税金 tax_rate(grade)
+      7. 输出 QuoteResponse(breakdown 4 类+items ≥ 10)
+
+    返回: (QuoteResponse, 内部明细 raw 列表,便于日志)
+    """
+    prices = _load_prices()
+    grade = req.grade.value     # "简装"/"中档"/"高档"/"豪华"
+    logger.info("=== v3 fallback 计算启动 v3 路径 === _DATA_PATH=%s", _DATA_PATH.name)
+    pack = req.pack.value       # "半包"/"全包"/"整装"
+    area = req.area
+    district = req.district.value  # "蜀山区"/"庐阳区"/...
+
+    items: List[QuoteItem] = []
+    raw_items: List[dict] = []
+
+    main_total = 0.0
+    aux_total = 0.0
+    labor_total = 0.0
+
+    # 区域系数:乘到主材/辅材/人工/家具家电的每行 unit_price 上(避免负 unit_price)
+    # mgmt/tax 自身不乘(它们是按 base 算的派生项,不是基础消耗)
+    district_factor = float(prices["district_factor"].get(district, 1.0))
+
+    # ===== 1. 主材(全包/整装 才计入;半包业主自购) =====
+    if pack in ("全包", "整装"):
+        for name, spec in prices["main"].items():
+            unit = spec["unit"]
+            base_unit_price = _mid_price(spec, grade)
+            # 区域系数作用在单价上(factor<1 时单价变小,自然无负值)
+            unit_price = round(base_unit_price * district_factor, 2)
+            qty = _resolve_qty(name, area)
+            item, total = _line(name, "主材", unit, qty, unit_price)
+            items.append(item)
+            raw_items.append({"name": name, "category": "主材",
+                              "qty": qty, "unit_price": unit_price, "total": total,
+                              "base_unit_price": base_unit_price, "district_factor": district_factor})
+            main_total += total
+
+    # ===== 2. 辅材(半包/全包/整装 全部计入) =====
+    for name, spec in prices["aux"].items():
+        unit = spec["unit"]
+        base_unit_price = _mid_price(spec, grade)
+        unit_price = round(base_unit_price * district_factor, 2)
+        qty = _resolve_qty(name, area)
+        item, total = _line(name, "辅材", unit, qty, unit_price)
+        items.append(item)
+        raw_items.append({"name": name, "category": "辅材",
+                          "qty": qty, "unit_price": unit_price, "total": total,
+                          "base_unit_price": base_unit_price, "district_factor": district_factor})
+        aux_total += total
+
+    # ===== 3. 人工(半包/全包/整装 全部计入) =====
+    for name, spec in prices["labor"].items():
+        unit = spec["unit"]
+        base_unit_price = _mid_price(spec, grade)
+        unit_price = round(base_unit_price * district_factor, 2)
+        qty = _resolve_qty(name, area)
+        item, total = _line(name, "人工", unit, qty, unit_price)
+        items.append(item)
+        raw_items.append({"name": name, "category": "人工",
+                          "qty": qty, "unit_price": unit_price, "total": total,
+                          "base_unit_price": base_unit_price, "district_factor": district_factor})
+        labor_total += total
+
+    # ===== 4. 整装家具家电(仅整装模式;硬编码 (main+aux+labor)×0.4) =====
+    furniture_total = 0.0
+    if pack == "整装":
+        # 家具家电估算基于"已应用区域系数"的主材+辅材+人工(更贴近实际)
+        base = main_total + aux_total + labor_total
+        furniture_total = round(base * _FURNITURE_RATE, 2)
+        item = QuoteItem(
+            name="家具家电(整体软装)", category="主材", unit="套",
+            quantity=1, unit_price=furniture_total, total=furniture_total,
+        )
+        items.append(item)
+        raw_items.append({"name": "家具家电", "category": "主材",
+                          "qty": 1, "unit_price": furniture_total, "total": furniture_total,
+                          "district_factor": 1.0})
+        # 家具家电折入 material(breakdown 里 material 包含家具家电)
+        main_total += furniture_total
+
+    # 基础消耗总和(主材含家具家电 + 辅材 + 人工,所有项均已应用区域系数)
+    base_consumption = main_total + aux_total + labor_total
+    logger.info(
+        "区域系数应用 district=%s factor=%.2f base_consumption(含家具家电)=%.2f",
+        district, district_factor, base_consumption,
+    )
+
+    # ===== 5. 管理费(基于基础消耗总和) =====
+    # W3 v3.5 收紧:管理费率封顶 0.10(豪华 12% 太狠,178万×12%=21.4万)
+    # 高档 0.10,豪华 0.10(跟中档平齐,体现管理费率不跟档位线性增长)
+    raw_mgmt_rate = float(prices["mgmt_rate"][grade])
+    mgmt_rate = min(raw_mgmt_rate, 0.10)
+    mgmt_cost = round(base_consumption * mgmt_rate, 2)
+    items.append(QuoteItem(
+        name=f"管理费({int(mgmt_rate*100)}%)", category="管理", unit="项",
+        quantity=1, unit_price=mgmt_cost, total=mgmt_cost,
+    ))
+    raw_items.append({"name": "管理费", "category": "管理",
+                      "qty": 1, "unit_price": mgmt_cost, "total": mgmt_cost})
+
+    # ===== 6. 税金(基于 base_consumption + mgmt_cost) =====
+    tax_rate = float(prices["tax_rate"][grade])
+    tax_base = base_consumption + mgmt_cost
+    tax_cost = round(tax_base * tax_rate, 2)
+    items.append(QuoteItem(
+        name=f"税金(增值税{int(tax_rate*100)}%)", category="税金", unit="项",
+        quantity=1, unit_price=tax_cost, total=tax_cost,
+    ))
+    raw_items.append({"name": "税金", "category": "税金",
+                      "qty": 1, "unit_price": tax_cost, "total": tax_cost})
+
+    # ===== 7. 汇总 =====
+    # total = 基础消耗(含家具家电,已应用区域系数) + 管理费 + 税金
+    # breakdown 4 类(主材+辅材 / 人工 / 管理费 / 税金) 之和必须 = total
+    # material 字段 = 主材(含家具家电) + 辅材
+    total = round(base_consumption + mgmt_cost + tax_cost, 2)
+
+    breakdown = BreakdownItem(
+        material=round(main_total + aux_total, 2),  # 主材(含家具家电) + 辅材
+        labor=round(labor_total, 2),
+        management=mgmt_cost,
+        tax=tax_cost,
+    )
+
+    response = QuoteResponse(
+        success=True,
+        source="fallback",
+        request_id=None,
+        total=total,
+        breakdown=breakdown,
+        items=items,
+        area=area,
+        grade=grade,
+        pack=pack,
+        district=district,
+        generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+    logger.info(
+        "fallback v3 计算完成 area=%.1f grade=%s pack=%s district=%s "
+        "main=%.2f aux=%.2f labor=%.2f base=%.2f factor=%.2f "
+        "mgmt=%.2f tax=%.2f total=%.2f items=%d",
+        area, grade, pack, district,
+        main_total, aux_total, labor_total, base_consumption, district_factor,
+        mgmt_cost, tax_cost, total, len(items),
+    )
+    return response, raw_items

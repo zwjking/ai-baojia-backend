@@ -1,0 +1,436 @@
+﻿"""
+agnes-2.0-flash 客户端 - 真实 API 调用
+
+约束:
+  - API Key 走 .env,严禁入代码
+  - 强制 JSON 输出(response_format=json_object)
+  - 失败重试 1 次,仍失败抛 AgnesCallError 走 L2
+  - 全部请求/响应脱敏日志
+
+技术协议: OpenAI 兼容,POST /v1/chat/completions
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+from typing import Optional, Tuple
+
+import httpx
+
+from app.config import AGNES_API_KEY, AGNES_BASE_URL, AGNES_MODEL, mask_api_key
+from app.models.schemas import QuoteItem, QuoteResponse, BreakdownItem, QuoteRequest
+
+logger = logging.getLogger(__name__)
+
+# 端点
+CHAT_COMPLETIONS_URL = f"{AGNES_BASE_URL}/chat/completions"
+
+# 调试时只打印 Key 掩码
+logger.info("agnes client init: url=%s model=%s key=%s",
+            AGNES_BASE_URL, AGNES_MODEL, mask_api_key(AGNES_API_KEY))
+
+
+# ============== 异常 ==============
+class AgnesCallError(Exception):
+    """agnes 调用失败 - 触发 L2 降级"""
+    def __init__(self, message: str, status_code: Optional[int] = None, body: Optional[str] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = (body or "")[:500]  # 截断,避免日志爆炸
+
+
+# ============== Prompt 模板 ==============
+def build_quote_prompt(req: QuoteRequest, hfei_prices: dict) -> list[dict]:
+    """
+    构造 8 步问卷 -> agnes prompt
+
+    关键要求:
+      1. 强制 JSON 输出
+      2. 注入合肥本地价格基线(8 主材+5 辅材+5 工种+4 档管理费)
+      3. V4 升级: 注入 5 项分类(主材/辅材/人工/管理费/税费)、拆改/楼层/品牌档次
+      4. items ≥ 20 行(主材 5+4品牌独立计费, 辅材 5, 人工 5, 管理+税金 2, 拆改最多 2, 楼层搬运 1)
+    """
+    grade = req.grade.value
+    pack = req.pack.value
+    district = req.district.value
+    special = req.special or ["无"]
+
+    # 价格基线摘要(避免 prompt 过长)
+    main_summary = ", ".join(
+        f"{k}({grade}¥{v[grade]}/{v['unit']})"
+        for k, v in hfei_prices["main"].items()
+    )
+    aux_summary = ", ".join(
+        f"{k}({grade}¥{v[grade]}/{v['unit']})"
+        for k, v in hfei_prices["aux"].items()
+    )
+    labor_summary = ", ".join(
+        f"{k}({grade}¥{v[grade]}/{v['unit']})"
+        for k, v in hfei_prices["labor"].items()
+    )
+    mgmt = hfei_prices["mgmt_rate"][grade]
+    tax = hfei_prices["tax_rate"][grade]
+
+    # V4 输入回显拼装
+    v4_lines = []
+    if req.rooms:
+        v4_lines.append(f"- 房间数: {req.rooms}")
+    if req.floor is not None:
+        v4_lines.append(f"- 楼层: {req.floor}层{' 有电梯' if req.has_elevator else ' 无电梯' if req.has_elevator is False else ''}")
+    if req.demolition_wall_area and req.demolition_wall_area > 0:
+        v4_lines.append(f"- 拆墙面积: {req.demolition_wall_area} m² (¥80/m²)")
+    if req.demolition_build_area and req.demolition_build_area > 0:
+        v4_lines.append(f"- 砌墙面积: {req.demolition_build_area} m² (¥180/m²)")
+    # 4 项品牌档次
+    brand_tier_lines = []
+    for cat, field in [("地砖", "brand_tier_tile"), ("地板", "brand_tier_floor"),
+                       ("橱柜", "brand_tier_cabinet"), ("卫浴", "brand_tier_bathroom")]:
+        v = getattr(req, field, None)
+        if v:
+            brand_tier_lines.append(f"  * {cat}: {v.value}")
+    if brand_tier_lines:
+        v4_lines.append("- 主材品牌档次(独立于 grade, 走对应价格档):")
+        v4_lines.extend(brand_tier_lines)
+    v4_block = "\n".join(v4_lines) if v4_lines else "  (未提供 V4 字段, 走 V3 默认)"
+
+    system = f"""你是一名合肥本地资深装修造价师,严格按合肥 2026 年市场行情报价。
+
+【价格基线(参考档)】
+- 主材(8类):{main_summary}
+- 辅材(5类):{aux_summary}
+- 人工(5工种):{labor_summary}
+- 管理费率({grade}):{int(mgmt*100)}%
+- 增值税率({grade}):{int(tax*100)}%
+
+【顾工 V4 算账公式(合肥 2026-07 市场价) - 优先采用】
+1. 拆墙(砖混): ¥80-120/m²(中位 80),混凝土: ¥80-120/m²(中位 80)
+2. 砌墙(12墙/24墙): ¥85-160/m²(中位 120)
+3. 楼层系数(有电梯): ≤10层 0;11-20层 +4%;>20层 +6%
+4. 楼层系数(无电梯): 2-3层 +5%;4-6层 +8%;>6层 +12-20%
+5. 设计费: 普通 80-150元/m²;豪华 200-500元/m²(独立计费)
+6. 软装系数(豪华整装): 5500元/m²(家具+家电+软装+窗帘+灯具)
+7. 管理费(给业主报价): (主+辅+人) × 4%(豪华);普通 6%;半包 8%
+8. 税费(给业主报价): (主+辅+人+管) × 3.5%(含城建税/教育附加/印花税综合)
+9. 拆改>10m²: 每 10m² +2%,上限 15%
+10. 品牌档次(4项):经济→简装价,中档→中档价,高端→高档价(独立于 grade)
+
+【报价规则】
+1. 全包/整装 含主材;半包 不含主材(业主自购)
+2. 半包/全包/整装 都含 辅材+人工+管理费+税金
+3. 工程量基于建筑面积估算,合肥常见 89m² 用量经验系数:
+   客餐厅瓷砖=面积×0.85;乳胶漆=面积×2.4;套装木门=4樘;整体橱柜=1套
+4. 区域系数:蜀山/包河/滨湖 1.0,瑶海 0.98,庐阳 0.99
+5. 特殊需求(新风/地暖/中央空调)各加 ¥300-1500/m²
+6. 品牌档次(4项):经济→简装价,中档→中档价,高端→高档价(独立于 grade)
+7. 拆墙 ¥80/m², 砌墙 ¥120/m² (拆改费计入主材) - 顾工 7/11 基准
+8. 高楼层无电梯(>6层) 按顾工 4 层 +8% / >6 层 +12-20% 加价(辅材)
+9. 豪华整装 加设计费 ¥200/m² + 软装 ¥5500/m²(独立计费)
+
+【输出 schema 严格约束 - V4 双轨字段】
+你必须且只能输出以下 JSON 结构,字段名/类型严格匹配,不能加不能减:
+{{
+  "total": <number>,
+  "breakdown": {{
+    "material": <number>,     // 4 类费用: 材料费(主材+辅材)
+    "labor": <number>,        // 人工费
+    "management": <number>,   // 管理费
+    "tax": <number>           // 税金
+  }},
+  "breakdown_v4": {{           // V4 5 项分类(主材/辅材/人工/管理费/税费), **必填**
+    "main_material": {{
+      "category": "主材",
+      "total": <number>,
+      "items": [<item>, ...]  // 主材分类下的明细
+    }},
+    "auxiliary": {{
+      "category": "辅材",
+      "total": <number>,
+      "items": [<item>, ...]
+    }},
+    "labor": {{
+      "category": "人工",
+      "total": <number>,
+      "items": [<item>, ...]
+    }},
+    "management": {{
+      "category": "管理费",
+      "total": <number>,
+      "items": [<item>, ...]  // 1 项: 管理费
+    }},
+    "tax": {{
+      "category": "税费",
+      "total": <number>,
+      "items": [<item>, ...]  // 1 项: 税金
+    }}
+  }},
+  "items": [                  // 明细行数组,**严格 20-30 行**
+    {{
+      "name": "<string>",         // 项目名称
+      "category": "<string>",     // 主材|辅材|人工|管理|税金
+      "unit": "<string>",
+      "quantity": <number>,
+      "unit_price": <number>,
+      "total": <number>,
+      "brand": "<string>",        // V4 可选: 品牌名
+      "spec": "<string>"          // V4 可选: 规格型号
+    }}
+  ]
+}}
+
+【关键不变量(必须严格遵守,否则输出被拒)】
+- material + labor + management + tax = total(容差 < 5 元)
+- 5 项分类之和 = total(容差 < 5 元): main_material + auxiliary + labor + management + tax = total
+- sum(items[*].total) = total(容差 < 5 元) —— items 必须包含所有明细项
+- 每个 item 的 total = quantity * unit_price(容差 < 1 元)
+- items 严格 20-30 行 (V4 明细扩展, 16K token 限制)
+- breakdown_v4 5 项分类的 items **不能为空** (管理/税金可只 1 行)
+- 推荐 items 结构(共 22-25 行):
+  * 8 主材: 客餐厅瓷砖 + 卧室地板 + 厨房橱柜 + 卫浴套装 + 室内门 + 全屋柜体定制 + 吊顶(含灯槽) + 灯具
+  * 5 辅材: 水电料 + 防水 + 腻子 + 乳胶漆 + 五金件
+  * 5 人工: 水电 + 瓦工 + 木工 + 油漆 + 安装
+  * 1 管理
+  * 1 税金
+  * 整装追加: 1 家具家电(整体软装) + 1 设计费(豪华 200元/m²) + 1 软装(豪华 5500元/m²)
+  * 拆改追加(若有): 拆墙(80) + 砌墙(120) (≤ 2 行, 顾工 V4 基准)
+  * 楼层搬运追加(若有): 1 行(按顾工楼层系数: 无电梯>6层 +12-20%)
+
+【输出格式 - 严格遵守】
+- 仅返回 1 个 JSON 对象,起始 {{ 结束 }}
+- 不要 markdown 代码块标记 ```json```
+- 不要任何解释文字、注释、后续
+- 数字必须有效数值,不能 null/NaN
+- 输出总 token 必须 < 15000(扩展后额度)
+"""
+
+    user = f"""请给以下合肥装修项目报价:
+
+【8 步问卷】
+- 建筑面积: {req.area} m²
+- 户型: {req.layout}
+- 档次: {grade}
+- 包工: {pack}
+- 风格: {req.style}
+- 特殊需求: {', '.join(special)}
+- 区域: {district}
+- 联系方式: 已留资(内部字段,不参与报价)
+
+【V4 扩展输入】
+{v4_block}
+
+严格按 system 规则: items 严格 20-30 行,必须填 breakdown_v4 5 项分类,仅返回 1 个 JSON 对象,无任何额外文字。"""
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+# ============== 核心调用 ==============
+async def call_agnes_chat(
+    messages: list[dict],
+    *,
+    model: str = AGNES_MODEL,
+    temperature: float = 0.2,
+    max_tokens: int = 16000,
+    timeout: float = 200.0,
+) -> Tuple[dict, str, float]:
+    """
+    真实调 agnes chat completions
+
+    返回: (parsed_json_body, request_id, elapsed_ms)
+    抛出: AgnesCallError
+    """
+    headers = {
+        "Authorization": f"Bearer {AGNES_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+
+    request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    payload["user"] = request_id  # agnes 端追踪
+
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                CHAT_COMPLETIONS_URL,
+                headers=headers,
+                json=payload,
+            )
+    except httpx.TimeoutException as e:
+        raise AgnesCallError(f"agnes timeout: {e}")
+    except httpx.HTTPError as e:
+        raise AgnesCallError(f"agnes http error: {e}")
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    if resp.status_code != 200:
+        raise AgnesCallError(
+            f"agnes http {resp.status_code}",
+            status_code=resp.status_code,
+            body=resp.text,
+        )
+
+    body = resp.json()
+    if "choices" not in body or not body["choices"]:
+        raise AgnesCallError("agnes response missing choices", body=resp.text[:300])
+
+    content = body["choices"][0]["message"]["content"]
+    rid = body.get("id", request_id)
+    usage = body.get("usage", {})
+
+    logger.info(
+        "agnes OK request_id=%s elapsed_ms=%.0f prompt_tokens=%s completion_tokens=%s",
+        rid, elapsed_ms, usage.get("prompt_tokens"), usage.get("completion_tokens"),
+    )
+    return body, rid, elapsed_ms
+
+
+# ============== 高层: 8 步问卷 -> QuoteResponse ==============
+async def quote_via_agnes(
+    req: QuoteRequest,
+    hfei_prices: dict,
+    *,
+    max_retries: int = 1,
+) -> Tuple[QuoteResponse, dict]:
+    """
+    调 agnes 报价,失败重试 1 次
+
+    返回: (QuoteResponse, meta{request_id, elapsed_ms, retries, raw})
+    抛出: AgnesCallError
+    """
+    from app.services.fallback import _load_prices  # type: ignore
+    if hfei_prices is None:
+        hfei_prices = _load_prices()
+
+    messages = build_quote_prompt(req, hfei_prices)
+
+    raw_body = None
+    request_id = None
+    elapsed_ms = 0.0
+    last_error: Optional[Exception] = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            raw_body, request_id, elapsed_ms = await call_agnes_chat(messages)
+            last_error = None
+            break
+        except AgnesCallError as e:
+            last_error = e
+            logger.warning(
+                "agnes attempt %d/%d failed: %s",
+                attempt + 1, max_retries + 1, e,
+            )
+            if attempt < max_retries:
+                # 重试前 sleep 0.3s
+                await asyncio.sleep(0.3)
+            else:
+                raise
+
+    # 解析 agnes 返回的 content -> QuoteResponse
+    try:
+        content_str = raw_body["choices"][0]["message"]["content"]
+        content_json = json.loads(content_str)
+    except (KeyError, json.JSONDecodeError) as e:
+        raise AgnesCallError(f"agnes JSON parse failed: {e}", body=str(raw_body)[:500])
+
+    # 校验 + 转换为 Pydantic 模型
+    try:
+        items_raw = content_json.get("items", [])
+        items = [QuoteItem(**it) for it in items_raw]
+        breakdown = BreakdownItem(**content_json.get("breakdown", {}))
+
+        # V4: 解析 breakdown_v4(可选, 缺失时自动从 items 重建)
+        from app.models.schemas import BreakdownV4, CategoryBlock
+        bv4_raw = content_json.get("breakdown_v4")
+        if bv4_raw:
+            breakdown_v4 = BreakdownV4(
+                main_material=CategoryBlock(**bv4_raw.get("main_material", {})),
+                auxiliary=CategoryBlock(**bv4_raw.get("auxiliary", {})),
+                labor=CategoryBlock(**bv4_raw.get("labor", {})),
+                management=CategoryBlock(**bv4_raw.get("management", {})),
+                tax=CategoryBlock(**bv4_raw.get("tax", {})),
+            )
+        else:
+            # 从 items 按 category 自动聚合
+            breakdown_v4 = None
+
+        response = QuoteResponse(
+            success=True,
+            source="agnes",
+            request_id=request_id,
+            total=float(content_json["total"]),
+            breakdown=breakdown,
+            items=items,
+            area=req.area,
+            grade=req.grade.value,
+            pack=req.pack.value,
+            district=req.district.value,
+            generated_at=raw_body.get("created") and
+                          _ts_to_iso(raw_body["created"]) or
+                          _now_iso(),
+            # V4 回显
+            rooms=req.rooms,
+            floor=req.floor,
+            has_elevator=req.has_elevator,
+            # 拆改费:优先用 agnes 返回的(若有),否则根据 req 字段算
+            demolition_cost=_compute_demolition_cost(req)
+                              if "demolition_cost" not in content_json
+                              else content_json.get("demolition_cost"),
+            material_brand_tier=_build_brand_tier_echo(req),
+            breakdown_v4=breakdown_v4,
+        )
+    except Exception as e:
+        raise AgnesCallError(f"agnes output schema invalid: {e}", body=str(content_json)[:500])
+
+    meta = {
+        "request_id": request_id,
+        "elapsed_ms": elapsed_ms,
+        "retries": max_retries if last_error is None else max_retries + 0,
+        "raw_total": response.total,
+        "raw_items_count": len(response.items),
+    }
+    return response, meta
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _ts_to_iso(ts: int) -> str:
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds")
+
+
+def _compute_demolition_cost(req: QuoteRequest) -> Optional[float]:
+    """V4: 拆改费回显(拆墙 80 + 砌墙 180)"""
+    total = 0.0
+    if req.demolition_wall_area and req.demolition_wall_area > 0:
+        total += round(req.demolition_wall_area * 80.0, 2)
+    if req.demolition_build_area and req.demolition_build_area > 0:
+        total += round(req.demolition_build_area * 180.0, 2)
+    return total if total > 0 else None
+
+
+def _build_brand_tier_echo(req: QuoteRequest) -> Optional[dict]:
+    """V4: 品牌档次回显(只输出实际传了的)"""
+    out = {}
+    if req.brand_tier_tile:
+        out["tile"] = req.brand_tier_tile.value
+    if req.brand_tier_floor:
+        out["floor"] = req.brand_tier_floor.value
+    if req.brand_tier_cabinet:
+        out["cabinet"] = req.brand_tier_cabinet.value
+    if req.brand_tier_bathroom:
+        out["bathroom"] = req.brand_tier_bathroom.value
+    return out if out else None

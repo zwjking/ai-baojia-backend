@@ -1,0 +1,235 @@
+"""
+L2 降级服务 - agnes 调用失败时,使用本地价格基线计算
+
+数据源: app/data/fallback_prices.json
+范围: 8 主材 + 5 辅材 + 5 工种 + 4 档管理费
+
+工程量规则: 见 qty_rule 字段(经验系数)
+"""
+from __future__ import annotations
+
+import json
+import logging
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+from app.models.schemas import (
+    BreakdownItem,
+    PackEnum,
+    QuoteItem,
+    QuoteRequest,
+    QuoteResponse,
+)
+
+logger = logging.getLogger(__name__)
+
+_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "fallback_prices.json"
+_PRICES_CACHE: Dict | None = None
+_PRICES_LOADED_AT: str | None = None
+
+
+def _load_prices() -> Dict:
+    """加载价格基线(进程内缓存)"""
+    global _PRICES_CACHE
+    if _PRICES_CACHE is None:
+        if not _DATA_PATH.exists():
+            raise FileNotFoundError(f"价格基线文件不存在: {_DATA_PATH}")
+        _PRICES_CACHE = _read_prices_from_disk()
+        logger.info("fallback 价格基线已加载 version=%s", _PRICES_CACHE.get("version"))
+    return _PRICES_CACHE
+
+
+def _read_prices_from_disk() -> Dict:
+    """从磁盘读最新价格基线(每次重读,不缓存)
+    用 utf-8-sig 兼容 BOM (Windows 工具保存的 JSON 经常带 BOM)
+    """
+    with _DATA_PATH.open("r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+    return data
+
+
+def reload_prices() -> Dict:
+    """
+    热重载价格基线 - 清空内存缓存,重新从 JSON 读取
+
+    用途:
+      - 价格基线更新时,调 POST /api/admin/reload-prices 即可生效,无需重启服务
+      - 调用线程安全(FastAPI 单进程异步,实际只在事件循环内调用)
+
+    返回:
+      重新加载后的价格字典(供 admin 接口回显 version/loaded_at)
+    """
+    global _PRICES_CACHE, _PRICES_LOADED_AT
+    if not _DATA_PATH.exists():
+        raise FileNotFoundError(f"价格基线文件不存在: {_DATA_PATH}")
+    new_data = _read_prices_from_disk()
+    old_version = _PRICES_CACHE.get("version") if _PRICES_CACHE else None
+    _PRICES_CACHE = new_data
+    _PRICES_LOADED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    logger.info(
+        "fallback 价格基线热重载完成 old_version=%s new_version=%s",
+        old_version, new_data.get("version"),
+    )
+    return new_data
+
+
+def get_cache_meta() -> Dict:
+    """返回缓存元信息(供 admin 接口展示)"""
+    return {
+        "version": _PRICES_CACHE.get("version") if _PRICES_CACHE else None,
+        "loaded_at": _PRICES_LOADED_AT,
+        "path": str(_DATA_PATH),
+        "cached": _PRICES_CACHE is not None,
+    }
+
+
+def _qty(name: str, area: float, unit: str, qty_rule: Dict) -> float:
+    """根据工程量规则估算单品用量"""
+    # 主材
+    if name == "客餐厅瓷砖":
+        return round(area * qty_rule["瓷砖系数"], 2)
+    if name == "厨卫墙砖":
+        return round(area * qty_rule["瓷砖系数"] * 0.35, 2)  # 厨卫占 35%
+    if name == "厨卫地砖":
+        return round(area * qty_rule["瓷砖系数"] * 0.15, 2)  # 厨卫地占 15%
+    if name == "卧室木地板":
+        return round(area * qty_rule["木地板系数"], 2)
+    if name == "乳胶漆":
+        return round(area * qty_rule["乳胶漆系数"], 2)
+    if name == "套装木门":
+        return float(qty_rule["套装木门"])
+    if name == "整体橱柜":
+        return float(qty_rule["整体橱柜"])
+    if name == "卫浴五件套":
+        return float(qty_rule["卫浴套"])
+    # 辅材
+    if name == "水泥":
+        return round(area * qty_rule["水泥袋/m²"], 0)
+    if name == "黄沙":
+        return round(area * qty_rule["黄沙m³/m²"], 3)
+    if name == "腻子粉":
+        return round(area * qty_rule["腻子粉袋/m²"], 0)
+    if name == "电线":
+        return round(area * qty_rule["电线m/m²"], 0)
+    if name == "水管":
+        return round(area * qty_rule["水管m/m²"], 0)
+    # 人工(按 m²)
+    if name in ("水电工", "防水"):
+        return round(area * qty_rule["水电工/防水按 m²"], 2)
+    if name == "瓦工":
+        return round(area * qty_rule["瓦工按铺贴 m²"], 2)
+    if name == "木工":
+        return round(area * qty_rule["木工按投影 m²"], 2)
+    if name == "油漆工":
+        return round(area * qty_rule["油漆工按涂刷 m²"], 2)
+    raise ValueError(f"未知品类: {name}")
+
+
+def compute_fallback(req: QuoteRequest) -> Tuple[QuoteResponse, List[dict]]:
+    """
+    用本地价格基线算报价
+    返回: (QuoteResponse, 内部明细 raw 列表,便于日志)
+    """
+    prices = _load_prices()
+    grade = req.grade.value  # "简装"/"中档"/"高档"/"豪华"
+    pack = req.pack.value
+    area = req.area
+    qty_rule = prices["qty_rule"]
+
+    items: List[QuoteItem] = []
+    raw_items: List[dict] = []
+    material_total = 0.0
+    aux_total = 0.0
+    labor_total = 0.0
+
+    # ===== 主材(全包/整装 才计入;半包业主自购) =====
+    if pack in ("全包", "整装"):
+        for name, spec in prices["main"].items():
+            unit = spec["unit"]
+            unit_price = spec[grade]
+            qty = _qty(name, area, unit, qty_rule)
+            total = round(qty * unit_price, 2)
+            items.append(QuoteItem(
+                name=name, category="主材", unit=unit,
+                quantity=qty, unit_price=unit_price, total=total,
+            ))
+            raw_items.append({"name": name, "category": "主材", "qty": qty, "unit_price": unit_price, "total": total})
+            material_total += total
+
+    # ===== 辅材(半包起都包) =====
+    for name, spec in prices["aux"].items():
+        unit = spec["unit"]
+        unit_price = spec[grade]
+        qty = _qty(name, area, unit, qty_rule)
+        total = round(qty * unit_price, 2)
+        items.append(QuoteItem(
+            name=name, category="辅材", unit=unit,
+            quantity=qty, unit_price=unit_price, total=total,
+        ))
+        raw_items.append({"name": name, "category": "辅材", "qty": qty, "unit_price": unit_price, "total": total})
+        aux_total += total
+
+    # ===== 人工(都包) =====
+    for name, spec in prices["labor"].items():
+        unit = spec["unit"]
+        unit_price = spec[grade]
+        qty = _qty(name, area, unit, qty_rule)
+        total = round(qty * unit_price, 2)
+        items.append(QuoteItem(
+            name=name, category="人工", unit=unit,
+            quantity=qty, unit_price=unit_price, total=total,
+        ))
+        raw_items.append({"name": name, "category": "人工", "qty": qty, "unit_price": unit_price, "total": total})
+        labor_total += total
+
+    # ===== 管理费 =====
+    mgmt_rate = prices["mgmt_rate"][grade]
+    mgmt_base = material_total + aux_total + labor_total
+    mgmt_cost = round(mgmt_base * mgmt_rate, 2)
+    items.append(QuoteItem(
+        name=f"管理费({int(mgmt_rate*100)}%)", category="管理", unit="项",
+        quantity=1, unit_price=mgmt_cost, total=mgmt_cost,
+    ))
+    raw_items.append({"name": "管理费", "category": "管理", "qty": 1, "unit_price": mgmt_cost, "total": mgmt_cost})
+
+    # ===== 税金 =====
+    tax_rate = prices["tax_rate"][grade]
+    tax_base = mgmt_base + mgmt_cost
+    tax_cost = round(tax_base * tax_rate, 2)
+    items.append(QuoteItem(
+        name=f"税金(增值税{int(tax_rate*100)}%)", category="税金", unit="项",
+        quantity=1, unit_price=tax_cost, total=tax_cost,
+    ))
+    raw_items.append({"name": "税金", "category": "税金", "qty": 1, "unit_price": tax_cost, "total": tax_cost})
+
+    total = round(material_total + aux_total + labor_total + mgmt_cost + tax_cost, 2)
+
+    breakdown = BreakdownItem(
+        material=round(material_total, 2),
+        labor=round(labor_total, 2),
+        management=mgmt_cost,
+        tax=tax_cost,
+    )
+    # 注: aux 不在 BreakdownItem 字段(4类=材料/人工/管理/税金),把 aux 折入 material
+    breakdown.material = round(material_total + aux_total, 2)
+
+    response = QuoteResponse(
+        success=True,
+        source="fallback",
+        request_id=None,
+        total=total,
+        breakdown=breakdown,
+        items=items,
+        area=area,
+        grade=grade,
+        pack=pack,
+        district=req.district.value,
+        generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+    logger.info(
+        "fallback 计算完成 area=%.1f grade=%s pack=%s total=%.2f items=%d",
+        area, grade, pack, total, len(items),
+    )
+    return response, raw_items

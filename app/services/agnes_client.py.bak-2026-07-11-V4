@@ -1,0 +1,315 @@
+"""
+agnes-2.0-flash 客户端 - 真实 API 调用
+
+约束:
+  - API Key 走 .env,严禁入代码
+  - 强制 JSON 输出(response_format=json_object)
+  - 失败重试 1 次,仍失败抛 AgnesCallError 走 L2
+  - 全部请求/响应脱敏日志
+
+技术协议: OpenAI 兼容,POST /v1/chat/completions
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+from typing import Optional, Tuple
+
+import httpx
+
+from app.config import AGNES_API_KEY, AGNES_BASE_URL, AGNES_MODEL, mask_api_key
+from app.models.schemas import QuoteItem, QuoteResponse, BreakdownItem, QuoteRequest
+
+logger = logging.getLogger(__name__)
+
+# 端点
+CHAT_COMPLETIONS_URL = f"{AGNES_BASE_URL}/chat/completions"
+
+# 调试时只打印 Key 掩码
+logger.info("agnes client init: url=%s model=%s key=%s",
+            AGNES_BASE_URL, AGNES_MODEL, mask_api_key(AGNES_API_KEY))
+
+
+# ============== 异常 ==============
+class AgnesCallError(Exception):
+    """agnes 调用失败 - 触发 L2 降级"""
+    def __init__(self, message: str, status_code: Optional[int] = None, body: Optional[str] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = (body or "")[:500]  # 截断,避免日志爆炸
+
+
+# ============== Prompt 模板 ==============
+def build_quote_prompt(req: QuoteRequest, hfei_prices: dict) -> list[dict]:
+    """
+    构造 8 步问卷 -> agnes prompt
+
+    关键要求:
+      1. 强制 JSON 输出
+      2. 注入合肥本地价格基线(8 主材+5 辅材+5 工种+4 档管理费)
+      3. 明确 schema: total / breakdown 4 类 / items ≥ 10 行
+    """
+    grade = req.grade.value
+    pack = req.pack.value
+    district = req.district.value
+    special = req.special or ["无"]
+
+    # 价格基线摘要(避免 prompt 过长)
+    main_summary = ", ".join(
+        f"{k}({grade}¥{v[grade]}/{v['unit']})"
+        for k, v in hfei_prices["main"].items()
+    )
+    aux_summary = ", ".join(
+        f"{k}({grade}¥{v[grade]}/{v['unit']})"
+        for k, v in hfei_prices["aux"].items()
+    )
+    labor_summary = ", ".join(
+        f"{k}({grade}¥{v[grade]}/{v['unit']})"
+        for k, v in hfei_prices["labor"].items()
+    )
+    mgmt = hfei_prices["mgmt_rate"][grade]
+    tax = hfei_prices["tax_rate"][grade]
+
+    system = f"""你是一名合肥本地资深装修造价师,严格按合肥 2026 年市场行情报价。
+
+【价格基线(参考档)】
+- 主材(8类):{main_summary}
+- 辅材(5类):{aux_summary}
+- 人工(5工种):{labor_summary}
+- 管理费率({grade}):{int(mgmt*100)}%
+- 增值税率({grade}):{int(tax*100)}%
+
+【报价规则】
+1. 全包/整装 含主材;半包 不含主材(业主自购)
+2. 半包/全包/整装 都含 辅材+人工+管理费+税金
+3. 工程量基于建筑面积估算,合肥常见 89m² 用量经验系数:
+   客餐厅瓷砖=面积×0.85;乳胶漆=面积×2.4;套装木门=4樘;整体橱柜=1套
+4. 区域系数:蜀山/包河/滨湖 1.0,瑶海 0.98,庐阳 0.99
+5. 特殊需求(新风/地暖/中央空调)各加 ¥300-1500/m²
+
+【输出 schema 严格约束 - 字段名不可改,值类型不可改】
+你必须且只能输出以下 JSON 结构,字段名/类型严格匹配,不能加不能减:
+{{
+  "total": <number>,          // 总价(元,数字>0,保留 2 位小数)
+  "breakdown": {{
+    "material": <number>,     // 材料费合计(主材+辅材,2 位小数)
+    "labor": <number>,        // 人工费合计(2 位小数)
+    "management": <number>,   // 管理费合计(2 位小数)
+    "tax": <number>           // 税金合计(2 位小数)
+  }},
+  "items": [                  // 明细行数组,**严格 12-15 行**
+    {{
+      "name": "<string>",         // 项目名称(2-15 字,简洁,如 "客餐厅瓷砖")
+      "category": "<string>",     // 类别,只能是 "主材"|"辅材"|"人工"|"管理"|"税金"
+      "unit": "<string>",         // 计量单位,如 "m²","套","樘","项"
+      "quantity": <number>,       // 工程量(>=0,2 位小数)
+      "unit_price": <number>,     // 单价(元,>=0,2 位小数)
+      "total": <number>           // 合价(元,=quantity*unit_price,2 位小数)
+    }}
+  ]
+}}
+
+【关键不变量(必须严格遵守,否则输出被拒)】
+- material + labor + management + tax = total(容差 < 5 元)
+- sum(items[*].total) = total(容差 < 5 元) —— items 列表必须包含所有明细项,不能遗漏!
+- 每个 item 的 total = quantity * unit_price(容差 < 1 元)
+- items 严格 12-15 行(超过 15 行会被截断,JSON 解析失败)
+- items 分类原则:
+  * 主材 + 辅材 项合价 之和 == breakdown.material
+  * 人工 项合价 之和 == breakdown.labor
+  * 管理 1 项 = breakdown.management
+  * 税金 1 项 = breakdown.tax
+- 推荐 items 结构(总 12-14 行):
+  * 5 主材: 客餐厅瓷砖 + 卧室地板 + 厨房橱柜 + 卫浴套装 + 室内门
+  * 4 辅材: 水电料 + 防水 + 腻子 + 乳胶漆
+  * 3 人工: 水电 + 瓦工 + 油漆
+  * 1 管理
+  * 1 税金
+  共 14 行(无需全屋柜体定制/吊顶/灯具/木工/安装,如需可合并入主材)
+
+【输出格式 - 严格遵守】
+- 仅返回 1 个 JSON 对象,起始 {{ 结束 }}
+- 不要 markdown 代码块标记 ```json```
+- 不要任何解释文字、注释、后续
+- 数字必须有效数值,不能 null/NaN
+- 输出总 token 必须 < 4000(超出会被截断)
+"""
+
+    user = f"""请给以下合肥装修项目报价:
+
+【8 步问卷】
+- 建筑面积: {req.area} m²
+- 户型: {req.layout}
+- 档次: {grade}
+- 包工: {pack}
+- 风格: {req.style}
+- 特殊需求: {', '.join(special)}
+- 区域: {district}
+- 联系方式: 已留资(内部字段,不参与报价)
+
+严格按 system 规则: items 严格 12-15 行,仅返回 1 个 JSON 对象,无任何额外文字。"""
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+# ============== 核心调用 ==============
+async def call_agnes_chat(
+    messages: list[dict],
+    *,
+    model: str = AGNES_MODEL,
+    temperature: float = 0.2,
+    max_tokens: int = 12000,
+    timeout: float = 150.0,
+) -> Tuple[dict, str, float]:
+    """
+    真实调 agnes chat completions
+
+    返回: (parsed_json_body, request_id, elapsed_ms)
+    抛出: AgnesCallError
+    """
+    headers = {
+        "Authorization": f"Bearer {AGNES_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+
+    request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    payload["user"] = request_id  # agnes 端追踪
+
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                CHAT_COMPLETIONS_URL,
+                headers=headers,
+                json=payload,
+            )
+    except httpx.TimeoutException as e:
+        raise AgnesCallError(f"agnes timeout: {e}")
+    except httpx.HTTPError as e:
+        raise AgnesCallError(f"agnes http error: {e}")
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    if resp.status_code != 200:
+        raise AgnesCallError(
+            f"agnes http {resp.status_code}",
+            status_code=resp.status_code,
+            body=resp.text,
+        )
+
+    body = resp.json()
+    if "choices" not in body or not body["choices"]:
+        raise AgnesCallError("agnes response missing choices", body=resp.text[:300])
+
+    content = body["choices"][0]["message"]["content"]
+    rid = body.get("id", request_id)
+    usage = body.get("usage", {})
+
+    logger.info(
+        "agnes OK request_id=%s elapsed_ms=%.0f prompt_tokens=%s completion_tokens=%s",
+        rid, elapsed_ms, usage.get("prompt_tokens"), usage.get("completion_tokens"),
+    )
+    return body, rid, elapsed_ms
+
+
+# ============== 高层: 8 步问卷 -> QuoteResponse ==============
+async def quote_via_agnes(
+    req: QuoteRequest,
+    hfei_prices: dict,
+    *,
+    max_retries: int = 1,
+) -> Tuple[QuoteResponse, dict]:
+    """
+    调 agnes 报价,失败重试 1 次
+
+    返回: (QuoteResponse, meta{request_id, elapsed_ms, retries, raw})
+    抛出: AgnesCallError
+    """
+    from app.services.fallback import _load_prices  # type: ignore
+    if hfei_prices is None:
+        hfei_prices = _load_prices()
+
+    messages = build_quote_prompt(req, hfei_prices)
+
+    raw_body = None
+    request_id = None
+    elapsed_ms = 0.0
+    last_error: Optional[Exception] = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            raw_body, request_id, elapsed_ms = await call_agnes_chat(messages)
+            last_error = None
+            break
+        except AgnesCallError as e:
+            last_error = e
+            logger.warning(
+                "agnes attempt %d/%d failed: %s",
+                attempt + 1, max_retries + 1, e,
+            )
+            if attempt < max_retries:
+                # 重试前 sleep 0.3s
+                await asyncio.sleep(0.3)
+            else:
+                raise
+
+    # 解析 agnes 返回的 content -> QuoteResponse
+    try:
+        content_str = raw_body["choices"][0]["message"]["content"]
+        content_json = json.loads(content_str)
+    except (KeyError, json.JSONDecodeError) as e:
+        raise AgnesCallError(f"agnes JSON parse failed: {e}", body=str(raw_body)[:500])
+
+    # 校验 + 转换为 Pydantic 模型
+    try:
+        items = [QuoteItem(**it) for it in content_json.get("items", [])]
+        breakdown = BreakdownItem(**content_json.get("breakdown", {}))
+        response = QuoteResponse(
+            success=True,
+            source="agnes",
+            request_id=request_id,
+            total=float(content_json["total"]),
+            breakdown=breakdown,
+            items=items,
+            area=req.area,
+            grade=req.grade.value,
+            pack=req.pack.value,
+            district=req.district.value,
+            generated_at=raw_body.get("created") and
+                          _ts_to_iso(raw_body["created"]) or
+                          _now_iso(),
+        )
+    except Exception as e:
+        raise AgnesCallError(f"agnes output schema invalid: {e}", body=str(content_json)[:500])
+
+    meta = {
+        "request_id": request_id,
+        "elapsed_ms": elapsed_ms,
+        "retries": max_retries if last_error is None else max_retries + 0,
+        "raw_total": response.total,
+        "raw_items_count": len(response.items),
+    }
+    return response, meta
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _ts_to_iso(ts: int) -> str:
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds")

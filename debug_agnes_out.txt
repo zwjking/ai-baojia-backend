@@ -1,0 +1,141 @@
+﻿=== System prompt length: 2268 chars ===
+=== User prompt: 璇风粰浠ヤ笅鍚堣偉瑁呬慨椤圭洰鎶ヤ环:
+
+銆? 姝ラ棶鍗枫€?
+- 寤虹瓚闈㈢Н: 60.0 m虏
+- 鎴峰瀷: 2瀹?鍘?鍗?
+- 妗ｆ: 绠€瑁?
+- 鍖呭伐: 鍏ㄥ寘
+- 椋庢牸: 绠€绾?
+- 鐗规畩闇€姹? 鏃?
+- 鍖哄煙: 鐟舵捣鍖?
+- 鑱旂郴鏂瑰紡: 宸茬暀璧?鍐呴儴瀛楁,涓嶅弬涓庢姤浠?
+
+涓ユ牸鎸?system 瑙勫垯: items 涓ユ牸 12-15 琛?浠呰繑鍥?1 涓?JSON 瀵硅薄,鏃犱换浣曢澶栨枃瀛椼€?===
+=== AGNES RAW (2299 chars) ===
+{
+  "total": 42728.00,
+  "breakdown": {
+    "material": 28157.36,
+    "labor": 11348.40,
+    "management": 1975.29,
+    "tax": 1246.95
+  },
+  "items": [
+    {
+      "name": "瀹㈤鍘呯摲鐮?,
+      "category": "涓绘潗",
+      "unit": "m虏",
+      "quantity": 51.00,
+      "unit_price": 98.00,
+      "total": 4998.00
+    },
+    {
+      "name": "鍗у鍦版澘",
+      "category": "涓绘潗",
+      "unit": "m虏",
+      "quantity": 24.00,
+      "unit_price": 117.60,
+      "total": 2822.40
+    },
+    {
+      "name": "鍘ㄦ埧姗辨煖",
+      "category": "涓绘潗",
+      "unit": "濂?,
+      "quantity": 1.00,
+      "unit_price": 4900.00,
+      "total": 4900.00
+    },
+    {
+      "name": "鍗荡濂楄",
+      "category": "涓绘潗",
+      "unit": "濂?,
+      "quantity": 1.00,
+      "unit_price": 2940.00,
+      "total": 2940.00
+    },
+    {
+      "name": "瀹ゅ唴闂?,
+      "category": "涓绘潗",
+      "unit": "妯?,
+      "quantity": 4.00,
+      "unit_price": 784.00,
+      "total": 3136.00
+    },
+    {
+      "name": "姘寸數鏂?,
+      "category": "杈呮潗",
+      "unit": "m虏",
+      "quantity": 60.00,
+      "unit_price": 49.00,
+      "total": 2940.00
+    },
+    {
+      "name": "闃叉按",
+      "category": "杈呮潗",
+      "unit": "m虏",
+      "quantity": 6.00,
+      "unit_price": 58.80,
+      "total": 352.80
+    },
+    {
+      "name": "鑵诲瓙",
+      "category": "杈呮潗",
+      "unit": "m虏",
+      "quantity": 144.00,
+      "unit_price": 17.64,
+      "total": 2540.16
+    },
+    {
+      "name": "涔宠兌婕?,
+      "category": "杈呮潗",
+      "unit": "m虏",
+      "quantity": 144.00,
+      "unit_price": 24.50,
+      "total": 3528.00
+    },
+    {
+      "name": "姘寸數",
+      "category": "浜哄伐",
+      "unit": "m虏",
+      "quantity": 60.00,
+      "unit_price": 68.60,
+      "total": 4116.00
+    },
+    {
+      "name": "鐡﹀伐",
+      "category": "浜哄伐",
+      "unit": "m虏",
+      "quantity": 51.00,
+      "unit_price": 58.80,
+      "total": 2998.80
+    },
+    {
+      "name": "娌规紗",
+      "category": "浜哄伐",
+      "unit": "m虏",
+      "quantity": 144.00,
+      "unit_price": 29.40,
+      "total": 4233.60
+    },
+    {
+      "name": "绠＄悊璐?,
+      "category": "绠＄悊",
+      "unit": "椤?,
+      "quantity": 1.00,
+      "unit_price": 1975.29,
+      "total": 1975.29
+    },
+    {
+      "name": "绋庨噾",
+      "category": "绋庨噾",
+      "unit": "椤?,
+      "quantity": 1.00,
+      "unit_price": 1246.95,
+      "total": 1246.95
+    }
+  ]
+}
+
+=== USAGE ===
+{'completion_tokens': 7018, 'prompt_tokens': 1694, 'total_tokens': 8712, 'completion_tokens_details': {'reasoning_tokens': 5938, 'text_tokens': 1080}, 'prompt_tokens_details': {'cached_tokens': 192}}

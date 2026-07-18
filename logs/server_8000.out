@@ -1,0 +1,46 @@
+2026-07-18 11:20:43 [INFO] app.main: ============================================================
+2026-07-18 11:20:43 [INFO] app.main: AI 报价网 W2 P1 启动 - 配置: {'AGNES_BASE_URL': 'https://apihub.agnes-ai.com/v1', 'AGNES_MODEL': 'agnes-2.0-flash', 'AGNES_API_KEY': 'sk-R***alU9', 'APP_HOST': '0.0.0.0', 'APP_PORT': 8000, 'APP_DEBUG': False, 'RATE_LIMIT_QPS': 5, 'ADMIN_TOKEN': '***MASKED***', 'LOGIN_FIXED_CODE': '***MASKED***', 'LOGIN_RATE_QPS': 1, 'LEAD_RATE_QPS': 1, 'LOG_LEVEL': 'INFO'}
+2026-07-18 11:20:43 [INFO] app.main: ============================================================
+2026-07-18 11:21:40 [INFO] app.routers.quote: POST /api/quote area=89.0 grade=中档 pack=半包 district=蜀山区 user_id=None force_fallback=True use_ml=True
+2026-07-18 11:21:40 [INFO] app.services.fallback: fallback 价格基线已加载 version=2026-07-12 path=fallback_prices_v3.json
+2026-07-18 11:21:40 [INFO] app.services.fallback: === v3 fallback 计算启动 v3 路径 === _DATA_PATH=fallback_prices_v3.json
+2026-07-18 11:21:40 [INFO] app.services.fallback: 区域系数应用 district=蜀山区 factor=1.00 base_consumption(含家具家电)=65494.85
+2026-07-18 11:21:40 [INFO] app.services.fallback: fallback v3 计算完成 area=89.0 grade=中档 pack=半包 district=蜀山区 main=0.00 aux=27736.60 labor=37758.25 base=65494.85 factor=1.00 mgmt=5239.59 tax=2122.03 total=72856.47 items=12 special_total=0.00 ml_features={"area": 89.0, "grade_num": 1, "pack_num": 0, "district_num": 0, "floor": 5, "has_elevator": 1, "demolition_wall": 0.0, "demolition_build": 0.0, "special_count": 0, "brand_tier_tile": 1, "brand_tier_floor": 1, "brand_tier_cabinet": 1, "brand_tier_bathroom": 1}
+2026-07-18 11:21:41 [INFO] app.services.ml_model: ML 模型加载成功: C:\Users\Administrator\.qclaw\shared\AI报价网后端\models\quote_dt_v1.pkl, 特征=['area', 'grade_num', 'pack_num', 'district_num', 'floor', 'has_elevator', 'demolition_wall', 'demolition_build', 'special_count', 'brand_tier_tile', 'brand_tier_floor', 'brand_tier_cabinet', 'brand_tier_bathroom']
+2026-07-18 11:21:41 [INFO] app.routers.quote: ML correction (preview only): 1.1123 -> total_ml=81038.25 (fallback=72856.47)
+2026-07-18 11:21:41 [INFO] app.routers.quote: V6 quote saved id=215 user_id=None source=fallback total=72856.47 request_id=215
+INFO:     127.0.0.1:58368 - "POST /api/quote?force_fallback=true HTTP/1.1" 200 OK
+2026-07-18 11:21:52 [INFO] app.routers.quote: POST /api/quote area=89.0 grade=中档 pack=半包 district=蜀山区 user_id=None force_fallback=True use_ml=True
+2026-07-18 11:21:52 [INFO] app.services.fallback: === v3 fallback 计算启动 v3 路径 === _DATA_PATH=fallback_prices_v3.json
+2026-07-18 11:21:52 [INFO] app.services.fallback: 区域系数应用 district=蜀山区 factor=1.00 base_consumption(含家具家电)=65494.85
+2026-07-18 11:21:52 [INFO] app.services.fallback: fallback v3 计算完成 area=89.0 grade=中档 pack=半包 district=蜀山区 main=0.00 aux=27736.60 labor=37758.25 base=65494.85 factor=1.00 mgmt=5239.59 tax=2122.03 total=72856.47 items=12 special_total=0.00 ml_features={"area": 89.0, "grade_num": 1, "pack_num": 0, "district_num": 0, "floor": 5, "has_elevator": 1, "demolition_wall": 0.0, "demolition_build": 0.0, "special_count": 0, "brand_tier_tile": 1, "brand_tier_floor": 1, "brand_tier_cabinet": 1, "brand_tier_bathroom": 1}
+2026-07-18 11:21:52 [INFO] app.routers.quote: ML correction (preview only): 1.1123 -> total_ml=81038.25 (fallback=72856.47)
+2026-07-18 11:21:52 [INFO] app.routers.quote: V6 quote saved id=216 user_id=None source=fallback total=72856.47 request_id=216
+INFO:     127.0.0.1:58383 - "POST /api/quote?force_fallback=true HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58921 - "GET /health HTTP/1.1" 200 OK
+2026-07-18 11:27:57 [INFO] app.routers.quote: POST /api/quote area=89.0 grade=中档 pack=半包 district=蜀山区 user_id=None force_fallback=True use_ml=True
+2026-07-18 11:27:57 [INFO] app.services.fallback: === v3 fallback 计算启动 v3 路径 === _DATA_PATH=fallback_prices_v3.json
+2026-07-18 11:27:57 [INFO] app.services.fallback: 区域系数应用 district=蜀山区 factor=1.00 base_consumption(含家具家电)=65494.85
+2026-07-18 11:27:57 [INFO] app.services.fallback: fallback v3 计算完成 area=89.0 grade=中档 pack=半包 district=蜀山区 main=0.00 aux=27736.60 labor=37758.25 base=65494.85 factor=1.00 mgmt=5239.59 tax=2122.03 total=72856.47 items=12 special_total=0.00 ml_features={"area": 89.0, "grade_num": 1, "pack_num": 0, "district_num": 0, "floor": 5, "has_elevator": 1, "demolition_wall": 0.0, "demolition_build": 0.0, "special_count": 0, "brand_tier_tile": 1, "brand_tier_floor": 1, "brand_tier_cabinet": 1, "brand_tier_bathroom": 1}
+2026-07-18 11:27:57 [INFO] app.routers.quote: ML correction (preview only): 1.1123 -> total_ml=81038.25 (fallback=72856.47)
+2026-07-18 11:27:57 [INFO] app.routers.quote: V6 quote saved id=217 user_id=None source=fallback total=72856.47 request_id=217
+INFO:     127.0.0.1:58925 - "POST /api/quote?force_fallback=true HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60697 - "POST /api/quote HTTP/1.1" 422 Unprocessable Entity
+INFO:     127.0.0.1:60771 - "GET /openapi.json HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60794 - "GET /openapi.json HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60822 - "POST /api/quote HTTP/1.1" 422 Unprocessable Entity
+INFO:     127.0.0.1:60903 - "POST /api/quote HTTP/1.1" 422 Unprocessable Entity
+2026-07-18 11:48:15 [INFO] app.routers.quote: POST /api/quote area=89.0 grade=中档 pack=半包 district=蜀山区 user_id=None force_fallback=True use_ml=True
+2026-07-18 11:48:15 [INFO] app.services.fallback: === v3 fallback 计算启动 v3 路径 === _DATA_PATH=fallback_prices_v3.json
+2026-07-18 11:48:15 [INFO] app.services.fallback: 区域系数应用 district=蜀山区 factor=1.00 base_consumption(含家具家电)=65494.85
+2026-07-18 11:48:15 [INFO] app.services.fallback: fallback v3 计算完成 area=89.0 grade=中档 pack=半包 district=蜀山区 main=0.00 aux=27736.60 labor=37758.25 base=65494.85 factor=1.00 mgmt=5239.59 tax=2122.03 total=72856.47 items=12 special_total=0.00 ml_features={"area": 89.0, "grade_num": 1, "pack_num": 0, "district_num": 0, "floor": 6, "has_elevator": 1, "demolition_wall": 0.0, "demolition_build": 0.0, "special_count": 0, "brand_tier_tile": 1, "brand_tier_floor": 1, "brand_tier_cabinet": 1, "brand_tier_bathroom": 1}
+2026-07-18 11:48:15 [INFO] app.routers.quote: ML correction (preview only): 1.1123 -> total_ml=81038.25 (fallback=72856.47)
+2026-07-18 11:48:15 [INFO] app.routers.quote: V6 quote saved id=218 user_id=None source=fallback total=72856.47 request_id=218
+INFO:     127.0.0.1:60967 - "POST /api/quote HTTP/1.1" 200 OK
+2026-07-18 11:48:39 [INFO] app.routers.quote: POST /api/quote area=89.0 grade=中档 pack=半包 district=蜀山区 user_id=None force_fallback=True use_ml=True
+2026-07-18 11:48:39 [INFO] app.services.fallback: === v3 fallback 计算启动 v3 路径 === _DATA_PATH=fallback_prices_v3.json
+2026-07-18 11:48:39 [INFO] app.services.fallback: 区域系数应用 district=蜀山区 factor=1.00 base_consumption(含家具家电)=65494.85
+2026-07-18 11:48:39 [INFO] app.services.fallback: fallback v3 计算完成 area=89.0 grade=中档 pack=半包 district=蜀山区 main=0.00 aux=27736.60 labor=37758.25 base=65494.85 factor=1.00 mgmt=5239.59 tax=2122.03 total=72856.47 items=12 special_total=0.00 ml_features={"area": 89.0, "grade_num": 1, "pack_num": 0, "district_num": 0, "floor": 6, "has_elevator": 1, "demolition_wall": 0.0, "demolition_build": 0.0, "special_count": 0, "brand_tier_tile": 1, "brand_tier_floor": 1, "brand_tier_cabinet": 1, "brand_tier_bathroom": 1}
+2026-07-18 11:48:39 [INFO] app.routers.quote: ML correction (preview only): 1.1123 -> total_ml=81038.25 (fallback=72856.47)
+2026-07-18 11:48:39 [INFO] app.routers.quote: V6 quote saved id=219 user_id=None source=fallback total=72856.47 request_id=219
+INFO:     127.0.0.1:61002 - "POST /api/quote HTTP/1.1" 200 OK

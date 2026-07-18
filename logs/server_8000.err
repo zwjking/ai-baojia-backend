@@ -1,0 +1,6 @@
+C:\Users\Administrator\.qclaw\shared\AI报价网后端\app\routers\export.py:131: FastAPIDeprecationWarning: `regex` has been deprecated, please use `pattern` instead
+  format: str = Query("pdf", regex="^(pdf|xlsx)$", description="导出格式: pdf 或 xlsx"),
+INFO:     Started server process [5988]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)

@@ -1,0 +1,225 @@
+"""
+报价接口 - POST /api/quote
+
+流程:
+  1. Pydantic 强校验(8 步问卷)
+  2. 限流 5 QPS
+  3. 调 agnes-2.0-flash,失败重试 1 次
+  4. 仍失败 -> L2 fallback
+  5. 返回报价 JSON
+  6. agnes 成功 -> 写入 SQLite quotes 表
+
+W2 P1 调整:
+  - 增加 user_id 字段关联
+  - 报价成功后写入 quotes 表
+  - agnes 失败走 fallback 时不写 quotes 表
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query, status
+from pydantic import Field
+
+from app.models.database import Quote, SessionLocal
+from app.models.schemas import QuoteRequest, QuoteResponse
+from app.services.agnes_client import AgnesCallError, quote_via_agnes
+from app.services.fallback import _load_prices, compute_fallback
+from app.utils.rate_limit import get_quote_limiter
+from app.utils.metrics import quote_total
+
+router = APIRouter(prefix="/api", tags=["quote"])
+logger = logging.getLogger(__name__)
+
+
+# W2 调整: user_id 关联(可选, 未登录也能报)
+class QuoteRequestW2(QuoteRequest):
+    """POST /api/quote W2 版本,增加 user_id(可选)"""
+    user_id: Optional[int] = Field(
+        default=None,
+        description="W2 关联用户 ID (登录后必填,W2 P1)",
+    )
+
+
+@router.post("/quote", response_model=QuoteResponse)
+async def create_quote(
+    req: QuoteRequestW2,
+    force_fallback: bool = Query(
+        default=False,
+        description="测试旁路: true=跳过 agnes,直接走 fallback (P0 验证热重载用)",
+    ),
+):
+    """
+    创建报价 - agnes 主路,fallback 兜底
+    W2 P1: agnes 成功后写入 SQLite quotes 表
+    """
+    t0 = time.perf_counter()
+    logger.info(
+        "POST /api/quote area=%.1f grade=%s pack=%s district=%s user_id=%s force_fallback=%s",
+        req.area, req.grade.value, req.pack.value, req.district.value,
+        req.user_id, force_fallback,
+    )
+
+    # 限流
+    result = get_quote_limiter().acquire()
+    if not result.allowed:
+        logger.warning("rate limited: /api/quote")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "rate_limited", "hint": "请求过于频繁,请稍后再试", "retry_after": result.retry_after},
+        )
+
+    prices = _load_prices()
+    source = "fallback"
+    request_id = None
+    agnes_elapsed_ms = 0.0
+    agnes_error = None
+    db = SessionLocal()
+    try:
+        # ===== L1: agnes (测试旁路 force_fallback=true 时跳过) =====
+        if not force_fallback:
+            try:
+                response, meta = await quote_via_agnes(req, prices, max_retries=1)
+                source = "agnes"
+                request_id = meta.get("request_id")
+                agnes_elapsed_ms = meta.get("elapsed_ms", 0.0)
+                logger.info(
+                    "agnes quote OK request_id=%s total=%.2f items=%d elapsed_ms=%.0f",
+                    request_id, response.total, len(response.items), agnes_elapsed_ms,
+                )
+                # W2 P1: agnes 成功 -> 写入 quotes 表
+                if req.user_id is not None:
+                    # V5: 从 agnes response 里抽 ml_features(如果有,否则从 req 复算一遍)
+                    ml_features = response.ml_features
+                    if ml_features is None:
+                        # 复算一遍(fallback 才会挂 ml_features, agnes 不会)
+                        try:
+                            from app.services.fallback import _extract_features
+                            ml_features = _extract_features(
+                                req=req, area=req.area, grade=req.grade.value,
+                                pack=req.pack.value, district=req.district.value,
+                                floor=req.floor, has_elevator=req.has_elevator,
+                                demolition_wall=req.demolition_wall_area or 0,
+                                demolition_build=req.demolition_build_area or 0,
+                                special=req.special or [],
+                                brand_tier_out={},  # agnes 路径不抽 brand
+                            )
+                        except Exception as ex:
+                            logger.warning("agnes path ml_features extract failed: %s", ex)
+                            ml_features = None
+                    quote_record = Quote(
+                        user_id=req.user_id,
+                        survey_json=json.dumps(
+                            {"area": req.area, "layout": req.layout, "grade": req.grade.value,
+                             "pack": req.pack.value, "style": req.style,
+                             "special": req.special, "district": req.district.value,
+                             # V4 扩展字段(全部可选)
+                             "rooms": req.rooms, "floor": req.floor, "has_elevator": req.has_elevator,
+                             "demolition_wall_area": req.demolition_wall_area,
+                             "demolition_build_area": req.demolition_build_area,
+                             "brand_tier_tile": req.brand_tier_tile.value if req.brand_tier_tile else None,
+                             "brand_tier_floor": req.brand_tier_floor.value if req.brand_tier_floor else None,
+                             "brand_tier_cabinet": req.brand_tier_cabinet.value if req.brand_tier_cabinet else None,
+                             "brand_tier_bathroom": req.brand_tier_bathroom.value if req.brand_tier_bathroom else None,
+                             },
+                            ensure_ascii=False,
+                        ),
+                        quote_json=json.dumps(
+                            {"total": response.total, "source": "agnes",
+                             "request_id": request_id, "items_count": len(response.items)},
+                            ensure_ascii=False,
+                        ),
+                        source="agnes",
+                        request_id=request_id,
+                        ml_features_json=json.dumps(ml_features, ensure_ascii=False) if ml_features else None,
+                        total_amount=response.total,
+                    )
+                    db.add(quote_record)
+                    db.commit()
+                    logger.info("quote saved to DB id=%s user_id=%s", quote_record.id, req.user_id)
+                quote_total.labels(path="agnes").inc()
+                return response
+            except AgnesCallError as e:
+                agnes_error = e
+                logger.warning("agnes quote failed, fallback to L2: %s", e)
+            except Exception as e:
+                agnes_error = e
+                logger.exception("agnes quote unexpected error: %s", e)
+        else:
+            agnes_error = AgnesCallError("force_fallback=true (test bypass)")
+            logger.info("force_fallback=true, skip agnes, go to L2")
+
+        # ===== L2: fallback =====
+        try:
+            response, raw = compute_fallback(req)
+            response.source = "fallback"
+            # V5+: 计算 ML 修正系数 (model.predict / fallback_total)
+            # 模型未加载时返回 1.0 (不修正)
+            if response.ml_features:
+                try:
+                    from app.services.ml_model import predict_correction
+                    correction = predict_correction(response.ml_features, response.total)
+                    response.ml_correction = correction
+                    response.total_ml = round(response.total * correction, 2)
+                    logger.info(
+                        "ML correction: %.4f -> total_ml=%.2f (fallback=%.2f)",
+                        correction, response.total_ml, response.total,
+                    )
+                except Exception as e:
+                    logger.warning("ML correction failed: %s", e)
+                    response.ml_correction = 1.0
+                    response.total_ml = None
+            # V5: fallback 也写 quotes 表(m为未来 ML 训练准备数据)
+            # 写库条件: 有 user_id 关联 OR 客户留资后能补
+            # 这里为了训练数据量, 全部 fallback 也写库(包含 ml_features + total)
+            if req.user_id is not None:
+                quote_record = Quote(
+                    user_id=req.user_id,
+                    survey_json=json.dumps(
+                        {"area": req.area, "layout": req.layout, "grade": req.grade.value,
+                         "pack": req.pack.value, "style": req.style,
+                         "special": req.special, "district": req.district.value,
+                         "rooms": req.rooms, "floor": req.floor, "has_elevator": req.has_elevator,
+                         "demolition_wall_area": req.demolition_wall_area,
+                         "demolition_build_area": req.demolition_build_area,
+                         "brand_tier_tile": req.brand_tier_tile.value if req.brand_tier_tile else None,
+                         "brand_tier_floor": req.brand_tier_floor.value if req.brand_tier_floor else None,
+                         "brand_tier_cabinet": req.brand_tier_cabinet.value if req.brand_tier_cabinet else None,
+                         "brand_tier_bathroom": req.brand_tier_bathroom.value if req.brand_tier_bathroom else None,
+                         },
+                        ensure_ascii=False,
+                    ),
+                    quote_json=json.dumps(
+                        {"total": response.total, "source": "fallback",
+                         "items_count": len(response.items),
+                         "breakdown": response.breakdown.model_dump() if hasattr(response.breakdown, 'model_dump') else dict(response.breakdown)},
+                        ensure_ascii=False,
+                    ),
+                    source="fallback",
+                    request_id=None,
+                    ml_features_json=json.dumps(response.ml_features, ensure_ascii=False) if response.ml_features else None,
+                    total_amount=response.total,
+                )
+                db.add(quote_record)
+                db.commit()
+                logger.info("fallback quote saved to DB id=%s user_id=%s ml_features=%d维",
+                            quote_record.id, req.user_id,
+                            len(response.ml_features) if response.ml_features else 0)
+            quote_total.labels(path="fallback").inc()
+            if agnes_error:
+                logger.warning(
+                    "fallback used because: %s | total=%.2f items=%d",
+                    agnes_error, response.total, len(response.items),
+                )
+            return response
+        except Exception as e:
+            logger.exception("fallback failed too: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"报价失败(agnes + fallback 均失败): {e}",
+            )
+    finally:
+        db.close()

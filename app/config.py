@@ -1,0 +1,119 @@
+"""
+应用配置 - 从 .env 读取,绝不接受明文硬编码
+
+注意:
+  - AGNES_API_KEY 必须通过 .env 注入
+  - .env 已被 .gitignore 排除
+  - 日志中自动掩码 API Key
+"""
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+
+# 项目根目录 = app 的父目录
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# 加载 .env (若存在)
+_ENV_PATH = BASE_DIR / ".env"
+if _ENV_PATH.exists():
+    load_dotenv(_ENV_PATH)
+
+
+def _get_env(key: str, default: Optional[str] = None) -> str:
+    """读取环境变量,缺失则抛错(关键项)或返回默认值"""
+    val = os.getenv(key, default)
+    if val is None:
+        raise RuntimeError(
+            f"缺少关键环境变量: {key}\n"
+            f"请在 .env 中配置 (参考 .env.example)"
+        )
+    return val
+
+
+# ===== agnes 配置 =====
+AGNES_API_KEY: str = _get_env("AGNES_API_KEY")
+AGNES_BASE_URL: str = _get_env("AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1")
+AGNES_MODEL: str = _get_env("AGNES_MODEL", "agnes-2.0-flash")
+
+# ===== 服务配置 =====
+APP_HOST: str = _get_env("APP_HOST", "0.0.0.0")
+APP_PORT: int = int(_get_env("APP_PORT", "8000"))
+APP_DEBUG: bool = _get_env("APP_DEBUG", "false").lower() == "true"
+
+# ===== 限流(全局默认) =====
+RATE_LIMIT_QPS: int = int(_get_env("RATE_LIMIT_QPS", "5"))
+
+# ===== 三层桶限流(P0-4) - 可通过 env 调阈 =====
+SMS_IP_LIMIT: int = int(_get_env("SMS_IP_LIMIT", "100"))
+SMS_IP_WINDOW: float = float(_get_env("SMS_IP_WINDOW", "60"))
+SMS_MOBILE_LIMIT: int = int(_get_env("SMS_MOBILE_LIMIT", "5"))
+SMS_MOBILE_WINDOW: float = float(_get_env("SMS_MOBILE_WINDOW", "86400"))
+
+REGISTER_IP_LIMIT: int = int(_get_env("REGISTER_IP_LIMIT", "10"))
+REGISTER_IP_WINDOW: float = float(_get_env("REGISTER_IP_WINDOW", "60"))
+REGISTER_MOBILE_LIMIT: int = int(_get_env("REGISTER_MOBILE_LIMIT", "5"))
+REGISTER_MOBILE_WINDOW: float = float(_get_env("REGISTER_MOBILE_WINDOW", "3600"))
+
+LOGIN_IP_LIMIT: int = int(_get_env("LOGIN_IP_LIMIT", "30"))
+LOGIN_IP_WINDOW: float = float(_get_env("LOGIN_IP_WINDOW", "60"))
+LOGIN_MOBILE_LIMIT: int = int(_get_env("LOGIN_MOBILE_LIMIT", "20"))
+LOGIN_MOBILE_WINDOW: float = float(_get_env("LOGIN_MOBILE_WINDOW", "3600"))
+
+FORGOT_IP_LIMIT: int = int(_get_env("FORGOT_IP_LIMIT", "30"))
+FORGOT_IP_WINDOW: float = float(_get_env("FORGOT_IP_WINDOW", "60"))
+FORGOT_MOBILE_LIMIT: int = int(_get_env("FORGOT_MOBILE_LIMIT", "10"))
+FORGOT_MOBILE_WINDOW: float = float(_get_env("FORGOT_MOBILE_WINDOW", "3600"))
+
+# ===== 管理鉴权 (W2 调整版 P0) =====
+ADMIN_TOKEN: str = _get_env("ADMIN_TOKEN")
+
+# ===== 登录验证码 (W2 调整版 P1) - 临时固定 123456 =====
+LOGIN_FIXED_CODE: str = _get_env("LOGIN_FIXED_CODE", "123456")
+
+# ===== 登录限流 (P1) =====
+LOGIN_RATE_QPS: int = int(_get_env("LOGIN_RATE_QPS", "1"))
+LEAD_RATE_QPS: int = int(_get_env("LEAD_RATE_QPS", "1"))
+
+# ===== 日志 =====
+LOG_LEVEL: str = _get_env("LOG_LEVEL", "INFO").upper()
+LOG_FILE: str = _get_env("LOG_FILE", "logs/app.log")
+
+
+# ===== 工具 =====
+def mask_api_key(key: str) -> str:
+    """API Key 脱敏: sk-XXXX...XXXX(保留前4后4)"""
+    if not key or len(key) < 12:
+        return "***INVALID***"
+    return f"{key[:4]}***{key[-4:]}"
+
+
+def safe_log_config() -> dict:
+    """返回配置字典,API Key 已脱敏,可安全打印/落日志"""
+    return {
+        "AGNES_BASE_URL": AGNES_BASE_URL,
+        "AGNES_MODEL": AGNES_MODEL,
+        "AGNES_API_KEY": mask_api_key(AGNES_API_KEY),
+        "APP_HOST": APP_HOST,
+        "APP_PORT": APP_PORT,
+        "APP_DEBUG": APP_DEBUG,
+        "RATE_LIMIT_QPS": RATE_LIMIT_QPS,
+        "ADMIN_TOKEN": "***MASKED***",  # 永远不打印明文
+        "LOGIN_FIXED_CODE": "***MASKED***",
+        "LOGIN_RATE_QPS": LOGIN_RATE_QPS,
+        "LEAD_RATE_QPS": LEAD_RATE_QPS,
+        "LOG_LEVEL": LOG_LEVEL,
+    }
+
+
+# 日志中也过滤 Bearer Token
+_BEARER_PATTERN = re.compile(r"(Bearer\s+)([A-Za-z0-9_\-]{8,})", re.IGNORECASE)
+
+
+def redact_bearer(text: str) -> str:
+    """将文本中的 Bearer token 脱敏"""
+    return _BEARER_PATTERN.sub(r"\1***REDACTED***", text)

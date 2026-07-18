@@ -1,0 +1,122 @@
+r"""
+AI 报价网 W2 P1 - FastAPI 入口
+
+启动:
+  cd C:\Users\Administrator\.qclaw\shared\AI报价网后端
+  python -m uvicorn app.main:app --reload --port 8000
+
+验证:
+  curl http://localhost:8000/health
+  curl -X POST http://localhost:8000/api/login -H "Content-Type: application/json" -d '{"mobile":"13800138000","code":"123456"}'
+  curl -X POST http://localhost:8000/api/quote -H "Content-Type: application/json" -d '{...}'
+"""
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from app.config import safe_log_config
+from app.routers import admin, auth, captcha, export, forgot, health, lead, password, quote, sms
+from app.utils.logger import setup_logging
+from app.utils.metrics import render_metrics
+
+setup_logging()
+
+# 确保数据目录存在
+os.makedirs(os.path.join(os.path.dirname(__file__), "data"), exist_ok=True)
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动/关闭钩子"""
+    logger.info("=" * 60)
+    logger.info("AI 报价网 W2 P1 启动 - 配置: %s", safe_log_config())
+    logger.info("=" * 60)
+    yield
+    logger.info("AI 报价网 W2 P1 关闭")
+
+
+app = FastAPI(
+    title="AI 报价网 W2 P1",
+    description="8 步问卷 + agnes-2.0-flash + 合肥本地价格基线,3 级降级 + SQLite + 限流 + 鉴权",
+    version="0.3.0",
+    lifespan=lifespan,
+)
+
+
+# 统一 Pydantic 422 错误格式
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request: Request, exc: RequestValidationError):
+    """422 校验失败 - 给前端清晰错误"""
+    # exc.errors() 内部含 ValueError 对象,不能直接 json.dumps
+    safe_errors = []
+    for err in exc.errors():
+        safe_err = {k: v for k, v in err.items() if k != "ctx"}
+        # ctx 里 'error' 可能是 ValueError,转成 str
+        if "ctx" in err:
+            safe_err["ctx"] = {k: str(v) for k, v in err["ctx"].items()}
+        safe_errors.append(safe_err)
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "error": "validation_failed",
+            "detail": safe_errors,
+            "hint": "请检查字段类型和约束(area 30-300, contact 11位手机号)",
+        },
+    )
+
+
+# 路由注册
+app.include_router(health.router)
+app.include_router(captcha.router)  # P0-1: 服务端图验
+app.include_router(sms.router)      # P0-7 + 盲点 1: 短信验证
+app.include_router(auth.router)     # W2 P1: 登录(验证码) + V3: 手机号+密码 + P0 加固
+app.include_router(password.router) # V2 登录改造: 手机号+密码
+app.include_router(forgot.router)   # V3: 忘记密码 + P0 加固
+app.include_router(quote.router)
+app.include_router(export.router)  # V7: PDF/Excel 导出
+app.include_router(lead.router)
+app.include_router(admin.router)
+
+
+# 盲点 3: Prometheus 指标暴露
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    """Prometheus 抓取端点 - 不计入 OpenAPI 文档"""
+    from fastapi.responses import Response
+    data, content_type = render_metrics()
+    return Response(content=data, media_type=content_type)
+
+
+@app.get("/")
+async def root():
+    return {
+        "service": "AI 报价网 V3 P0",
+        "version": "0.4.0",
+        "endpoints": [
+            "/health",
+            "/metrics",                  # 盲点 3: Prometheus
+            "/api/captcha",              # P0-1: 服务端图验
+            "/api/sms/send-code",        # P0-7: 发短信(需图验)
+            "/api/sms/verify-code",      # P0-7: 校验短信码
+            "/api/login",                # P0 加固: 密码(优先)/ 验证码(兜底)
+            "/api/login-password",       # V2: 密码登录(兼容)
+            "/api/register",             # P0 加固: 必须短信验证 + 协议勾选
+            "/api/reset-password",       # V2: 重置密码
+            "/api/forgot/reset",         # P0 加固: 必须短信验证
+            "/api/quote",
+            "/api/quote/{id}/export",   # V7: PDF/Excel 导出
+            "/api/lead",
+            "/api/admin/reload-prices",
+            "/api/admin/stats",
+            "/docs",
+        ],
+    }
