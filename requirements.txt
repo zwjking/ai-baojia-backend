@@ -1,7 +1,8 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 sqlalchemy==2.0.23
-psycopg2-binary==2.9.9
+# psycopg2-binary 已移除 - Railway 免费套餐用 SQLite，无需 PostgreSQL 驱动
+# 本地开发如需连接 Supabase，手动 pip install psycopg2-binary
 pydantic==2.5.2
 python-multipart==0.0.6
 bcrypt==4.1.2
