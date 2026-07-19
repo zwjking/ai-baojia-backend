@@ -128,7 +128,7 @@ def _recompute_full(quote_id: int) -> dict:
 @router.get("/{quote_id}/export")
 async def export_quote(
     quote_id: int,
-    format: str = Query("pdf", regex="^(pdf|xlsx)$", description="导出格式: pdf 或 xlsx"),
+    format: str = Query("pdf", pattern="^(pdf|xlsx)$", description="导出格式: pdf 或 xlsx"),
 ):
     """
     V7 导出接口: PDF / Excel
