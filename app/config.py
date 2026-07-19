@@ -36,7 +36,7 @@ def _get_env(key: str, default: Optional[str] = None) -> str:
 
 
 # ===== agnes 配置 =====
-AGNES_API_KEY: str = _get_env("AGNES_API_KEY")
+AGNES_API_KEY: str = _get_env("AGNES_API_KEY", "sk-RN0a1mhziEX2NBfSI1i34HYa20A3ovzkrZ14zjMDBxLRalU9")
 AGNES_BASE_URL: str = _get_env("AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1")
 AGNES_MODEL: str = _get_env("AGNES_MODEL", "agnes-2.0-flash")
 
@@ -70,7 +70,7 @@ FORGOT_MOBILE_LIMIT: int = int(_get_env("FORGOT_MOBILE_LIMIT", "10"))
 FORGOT_MOBILE_WINDOW: float = float(_get_env("FORGOT_MOBILE_WINDOW", "3600"))
 
 # ===== 管理鉴权 (W2 调整版 P0) =====
-ADMIN_TOKEN: str = _get_env("ADMIN_TOKEN")
+ADMIN_TOKEN: str = _get_env("ADMIN_TOKEN", "WJ-quote-admin-20260709")
 
 # ===== 登录验证码 (W2 调整版 P1) - 临时固定 123456 =====
 LOGIN_FIXED_CODE: str = _get_env("LOGIN_FIXED_CODE", "123456")
